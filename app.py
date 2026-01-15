@@ -52,6 +52,8 @@ else:
     logger.warning("⚠️  AI_BUILDER_TOKEN 未设置，RAG 功能将不可用")
 
 # 导入 RAG 模块（vector_indexer 使用 main.py 而不是 rag_main.py）
+RAG_AVAILABLE = False
+chat_with_agent = None
 try:
     from main import chat_with_agent
     RAG_AVAILABLE = True
@@ -59,8 +61,11 @@ try:
     logger.info(f"   索引路径: {INDEX_PATH}")
     logger.info(f"   元数据路径: {METADATA_PATH}")
 except Exception as e:
-    logger.warning(f"⚠️  RAG 模块加载失败: {e}")
+    logger.warning(f"⚠️  RAG 模块加载失败（索引文件可能不存在）: {e}")
+    logger.info("   这是正常的，云端演示版可以在没有索引文件的情况下运行")
+    logger.info("   录音功能正常工作，RAG 聊天功能将返回友好提示")
     RAG_AVAILABLE = False
+    chat_with_agent = None
 
 # 初始化定时任务调度器
 scheduler = BackgroundScheduler()
@@ -130,16 +135,20 @@ def sync_to_rag_system(voice_record):
         logger.debug(f"标记文件已创建: {flag_file}")
         
         # 实时触发增量索引（异步执行，不阻塞）
-        try:
-            scheduler.add_job(
-                incremental_rebuild_index,
-                id=f'incremental_index_{voice_record["id"]}',
-                name=f'增量索引-{voice_record["id"]}',
-                replace_existing=True
-            )
-            logger.info(f"✅ 已触发实时增量索引: {voice_record['id']}")
-        except Exception as e:
-            logger.warning(f"⚠️  触发增量索引失败: {e}，将在下次定时任务时重建")
+        # 只在 RAG 可用时触发索引重建
+        if RAG_AVAILABLE:
+            try:
+                scheduler.add_job(
+                    incremental_rebuild_index,
+                    id=f'incremental_index_{voice_record["id"]}',
+                    name=f'增量索引-{voice_record["id"]}',
+                    replace_existing=True
+                )
+                logger.info(f"✅ 已触发实时增量索引: {voice_record['id']}")
+            except Exception as e:
+                logger.warning(f"⚠️  触发增量索引失败: {e}，将在下次定时任务时重建")
+        else:
+            logger.info(f"ℹ️  RAG 功能不可用，跳过索引重建: {voice_record['id']}")
             
         logger.info(f"✓ 已同步到RAG系统: {voice_record['id']}")
         
@@ -1301,15 +1310,19 @@ def check_and_rebuild_index():
         logger.exception(f"✗ 索引重建异常: {e}")
 
 # 添加定时任务：每30分钟检查一次（作为兜底，主要依靠实时同步）
-scheduler.add_job(
-    check_and_rebuild_index,
-    trigger=IntervalTrigger(minutes=30),
-    id='rebuild_index_job',
-    name='定时重建索引（兜底）',
-    replace_existing=True
-)
-logger.info("✅ 定时索引重建任务已添加（每30分钟检查一次，作为兜底）")
-logger.info("✅ 实时同步已启用：录音保存后立即触发索引重建")
+# 只在 RAG 可用时添加定时任务
+if RAG_AVAILABLE:
+    scheduler.add_job(
+        check_and_rebuild_index,
+        trigger=IntervalTrigger(minutes=30),
+        id='rebuild_index_job',
+        name='定时重建索引（兜底）',
+        replace_existing=True
+    )
+    logger.info("✅ 定时索引重建任务已添加（每30分钟检查一次，作为兜底）")
+    logger.info("✅ 实时同步已启用：录音保存后立即触发索引重建")
+else:
+    logger.info("ℹ️  RAG 功能不可用，跳过定时索引重建任务")
 
 class ChatRequest(BaseModel):
     """聊天请求模型"""
@@ -1325,11 +1338,11 @@ class ChatResponse(BaseModel):
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat_api(request: ChatRequest):
     """RAG 聊天 API 端点"""
-    if not RAG_AVAILABLE:
+    if not RAG_AVAILABLE or chat_with_agent is None:
         return ChatResponse(
-            response="RAG 功能暂不可用，请检查配置",
+            response="RAG 功能暂不可用（索引文件未加载）。这是云端演示版，录音功能正常工作。如需完整 RAG 功能，请使用本地版本。",
             success=False,
-            error="RAG模块未加载"
+            error="RAG模块未加载（索引文件缺失）"
         )
     
     try:
@@ -1379,6 +1392,12 @@ async def get_index_status_api():
 @app.post("/api/rebuild-index")
 async def rebuild_index_api(background_tasks: BackgroundTasks):
     """手动触发索引重建"""
+    if not RAG_AVAILABLE:
+        return {
+            "success": False,
+            "error": "RAG 功能不可用（索引文件缺失）。这是云端演示版，无法重建索引。如需完整功能，请使用本地版本。"
+        }
+    
     try:
         # 检查是否正在运行
         current_status = get_index_status()
