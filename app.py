@@ -269,6 +269,9 @@ async def index():
         }
         
         .chat-history-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
             padding: 10px;
             border-radius: 5px;
             cursor: pointer;
@@ -470,6 +473,30 @@ async def index():
             background: #343541;
             border-left: 3px solid #19c37d;
         }
+
+        .conv-title {
+            flex: 1;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            cursor: pointer;
+        }
+
+        .conv-delete {
+            display: none;
+            color: #8e8ea0;
+            cursor: pointer;
+            padding: 0 5px;
+            font-size: 18px;
+        }
+
+        .conv-delete:hover {
+            color: #ef4444;
+        }
+
+        .chat-history-item:hover .conv-delete {
+            display: block;
+        }
     </style>
 </head>
 <body>
@@ -550,6 +577,9 @@ function initSpeechRecognition() {
                 stopRecording();
             }
         };
+    } else {
+        console.warn('当前浏览器不支持 Web Speech API 语音识别');
+        alert('当前浏览器不支持语音识别功能，请在桌面版 Chrome 浏览器中使用语音输入。');
     }
 }
 
@@ -637,11 +667,10 @@ function addMessage(role, content) {
 }
 
 function formatContent(content) {
-    return content
-        .replace(/\\n/g, '<br>')
-        .replace(/\n/g, '<br>')
-        .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
-        .replace(/\*(.*?)\*/g, '<em>$1</em>');
+    if (!content) return '';
+    // 将换行符统一转换为 <br>
+    var result = content.split("\\n").join("<br>");
+    return result;
 }
 
 function showTypingIndicator() {
@@ -733,22 +762,59 @@ async function loadConversations() {
             return;
         }
         
-        conversations.forEach(conv => {
-            const item = document.createElement('div');
+        conversations.forEach(function(conv) {
+            var item = document.createElement('div');
             item.className = 'chat-history-item';
             if (conv.id === currentConversationId) {
                 item.classList.add('active');
             }
-            
-            item.textContent = conv.title || '新对话';
+
+            // 标题区域
+            var titleSpan = document.createElement('span');
+            titleSpan.className = 'conv-title';
+            titleSpan.textContent = conv.title || '新对话';
+            titleSpan.onclick = function() { loadConversation(conv.id, item); };
+
+            // 删除按钮
+            var deleteBtn = document.createElement('span');
+            deleteBtn.className = 'conv-delete';
+            deleteBtn.textContent = '×';
+            deleteBtn.title = '删除会话';
+            deleteBtn.onclick = function(e) {
+                e.stopPropagation();
+                deleteConversation(conv.id);
+            };
+
+            item.appendChild(titleSpan);
+            item.appendChild(deleteBtn);
             item.title = (conv.created_at || '') + ' (' + (conv.message_count || 0) + '条消息)';
-            item.setAttribute('data-conv-id', conv.id);
-            item.onclick = function() { loadConversation(conv.id, this); };
-            
+
             historyDiv.appendChild(item);
         });
     } catch (error) {
         console.error('加载会话列表失败:', error);
+    }
+}
+
+// 删除会话
+async function deleteConversation(convId) {
+    if (!confirm('确定要删除这个会话吗？')) {
+        return;
+    }
+    
+    try {
+        await fetch('/api/conversations/' + convId, {
+            method: 'DELETE'
+        });
+        
+        // 如果删除的是当前会话，重置为新对话界面
+        if (convId === currentConversationId) {
+            newChat();
+        }
+        
+        await loadConversations();
+    } catch (error) {
+        console.error('删除会话失败:', error);
     }
 }
 
@@ -897,6 +963,22 @@ async def update_conversation(conv_id: str, data: ConversationUpdate):
         raise HTTPException(status_code=404, detail="会话不存在")
 
     save_conversations(conversations)
+    return {"status": "ok"}
+
+
+@app.delete("/api/conversations/{conv_id}")
+async def delete_conversation(conv_id: str):
+    """删除会话及其所有消息"""
+    # 删除会话
+    conversations = load_conversations()
+    conversations = [c for c in conversations if c.get("id") != conv_id]
+    save_conversations(conversations)
+
+    # 删除该会话的所有消息
+    records = load_records()
+    records = [r for r in records if r.get("conversation_id") != conv_id]
+    save_records(records)
+
     return {"status": "ok"}
 
 @app.post("/api/voice")
