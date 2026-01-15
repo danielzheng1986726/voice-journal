@@ -485,7 +485,9 @@ async def index():
     <script>
         let isRecording = false;
         let recognition = null;
+        let finalTranscript = '';  // 累积最终文本，解决停顿后内容丢失问题
         
+        // 初始化语音识别
         function initSpeechRecognition() {
             if ('webkitSpeechRecognition' in window) {
                 recognition = new webkitSpeechRecognition();
@@ -494,17 +496,39 @@ async def index():
                 recognition.lang = 'zh-CN';
                 
                 recognition.onresult = (event) => {
-                    let transcript = '';
+                    let interimTranscript = '';
                     for (let i = event.resultIndex; i < event.results.length; i++) {
-                        transcript += event.results[i][0].transcript;
+                        const result = event.results[i];
+                        const text = result[0].transcript;
+                        if (result.isFinal) {
+                            finalTranscript += text;
+                        } else {
+                            interimTranscript += text;
+                        }
                     }
-                    document.getElementById('inputBox').value = transcript;
-                    autoResize(document.getElementById('inputBox'));
+                    const inputBox = document.getElementById('inputBox');
+                    inputBox.value = finalTranscript + interimTranscript;
+                    autoResize(inputBox);
+                };
+                
+                recognition.onend = () => {
+                    // 如果还在录音状态（只是用户停顿），自动重启识别
+                    if (isRecording) {
+                        try {
+                            recognition.start();
+                        } catch (e) {
+                            console.error('重启语音识别失败:', e);
+                            stopRecording();
+                        }
+                    }
                 };
                 
                 recognition.onerror = (event) => {
                     console.error('语音识别错误:', event.error);
-                    stopRecording();
+                    // no-speech 只是没听到声音，不立即结束整次录音
+                    if (event.error !== 'no-speech') {
+                        stopRecording();
+                    }
                 };
             }
         }
@@ -522,17 +546,28 @@ async def index():
                 initSpeechRecognition();
             }
             if (recognition) {
-                recognition.start();
-                isRecording = true;
-                document.getElementById('voiceBtn').classList.add('recording');
+                // 开始新一轮录音时清空累积文本
+                finalTranscript = '';
+                try {
+                    recognition.start();
+                    isRecording = true;
+                    document.getElementById('voiceBtn').classList.add('recording');
+                } catch (e) {
+                    console.error('启动语音识别失败:', e);
+                }
             }
         }
         
         function stopRecording() {
-            if (recognition) {
-                recognition.stop();
-            }
+            // 先标记状态，避免 onend 中再次自动重启
             isRecording = false;
+            if (recognition) {
+                try {
+                    recognition.stop();
+                } catch (e) {
+                    console.error('停止语音识别失败:', e);
+                }
+            }
             document.getElementById('voiceBtn').classList.remove('recording');
         }
         
@@ -656,7 +691,51 @@ async def index():
             }
         }
         
-        initSpeechRecognition();
+        // 加载左侧历史记忆（最近 20 条带 [对话] 前缀的记录）
+        async function loadChatHistory() {
+            try {
+                const response = await fetch('/api/records');
+                const data = await response.json();
+                const records = (data && data.records) ? data.records : [];
+                
+                const historyDiv = document.getElementById('chatHistory');
+                historyDiv.innerHTML = '';
+                
+                const chatRecords = records
+                    .filter(r => r.content && r.content.startsWith('[对话]'))
+                    .slice(-20)
+                    .reverse();
+                
+                if (chatRecords.length === 0) {
+                    historyDiv.innerHTML = '<div style="color: #8e8ea0; padding: 10px; font-size: 14px;">暂无历史记录</div>';
+                    return;
+                }
+                
+                chatRecords.forEach(record => {
+                    const item = document.createElement('div');
+                    item.className = 'chat-history-item';
+                    let summary = record.content
+                        .replace('[对话] 我说：', '')
+                        .replace('[对话] AI 回复：', '');
+                    if (summary.length > 30) {
+                        summary = summary.substring(0, 30) + '...';
+                    }
+                    item.textContent = summary;
+                    const date = record.date || '';
+                    const time = record.time || '';
+                    item.title = (date + ' ' + time).trim();
+                    historyDiv.appendChild(item);
+                });
+            } catch (error) {
+                console.error('加载历史记录失败:', error);
+            }
+        }
+        
+        // 页面加载完成后初始化语音识别并加载历史
+        document.addEventListener('DOMContentLoaded', () => {
+            initSpeechRecognition();
+            loadChatHistory();
+        });
     </script>
 </body>
 </html>"""
