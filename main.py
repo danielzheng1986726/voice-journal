@@ -220,7 +220,7 @@ def call_retriever(query: str, date_filter: Optional[str] = None, max_results: i
     """
     调用检索服务，实施混合检索策略（关键词检索 + 向量检索）
     
-    修复实体混淆幻觉问题：通过关键词暴力检索确保稀有人名（如"Hansen"）能被准确召回。
+    修复实体混淆幻觉问题：通过关键词暴力检索确保稀有人名（如"张三"）能被准确召回。
     
     Args:
         query: 查询文本
@@ -275,7 +275,7 @@ def call_retriever(query: str, date_filter: Optional[str] = None, max_results: i
                         content_lower = content.lower()
                         
                         # 匹配逻辑：
-                        # - 单词查询：要求完整匹配（如 "Hansen"）
+                        # - 单词查询：要求完整匹配（如 "张三"）
                         # - 多词查询：要求包含所有关键词（如 "内心的小孩 名字" 需要包含 "内心的小孩" 和 "名字"）
                         if is_multi_word:
                             # 多词查询：检查是否包含所有关键词
@@ -389,7 +389,7 @@ def call_retriever(query: str, date_filter: Optional[str] = None, max_results: i
                         else:
                             # 对于其他来源的记录，使用严格的实体匹配：检查最长 token（核心实体）是否在内容中
                             # 示例：
-                            # - Query: "Hansen" -> Longest: "Hansen" -> 文档无 Hansen -> 丢弃 (正确)
+                            # - Query: "张三" -> Longest: "张三" -> 文档无 张三 -> 丢弃 (正确)
                             # - Query: "内心的小孩 名字" -> Longest: "内心的小孩" -> 文档有 "内心的小孩" -> 保留 (修复目标)
                             if longest_token_lower not in content_lower:
                                 logger.warning(f"⚠️  [检索清洗] 丢弃结果 ID={r.get('id')}, 日期={r.get('date')}：内容不含核心实体 '{longest_token}' (查询: '{query_stripped}')")
@@ -448,7 +448,7 @@ def call_retriever(query: str, date_filter: Optional[str] = None, max_results: i
             # ========== 5. 防幻觉兜底 ==========
             if not final_results:
                 logger.warning(f"⚠️  [防幻觉] 检索结果为空，返回防幻觉兜底消息")
-                return "【系统反馈】数据库中**完全没有**找到包含此关键词的记录。请直接告诉用户'没有找到相关记录'，**严禁**提及其他无关人物（特别是'王瀚琦'），**严禁**编造关系。"
+                return "【系统反馈】数据库中**完全没有**找到包含此关键词的记录。请直接告诉用户'没有找到相关记录'，**严禁**提及其他无关人物，**严禁**编造关系。"
             
             # ========== 6. 格式化结果供 LLM 阅读 ==========
             context_lines = ["【系统反馈】已找到以下相关记录：\n"]
