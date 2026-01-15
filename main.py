@@ -505,7 +505,7 @@ def call_retriever(query: str, date_filter: Optional[str] = None, max_results: i
         
         # 防幻觉兜底
         if not results:
-            return "【系统反馈】数据库中**完全没有**找到包含此关键词的记录。请直接告诉用户'没有找到相关记录'，**严禁**提及其他无关人物（特别是'王瀚琦'），**严禁**编造关系。"
+            return "【系统反馈】数据库中**完全没有**找到包含此关键词的记录。请直接告诉用户'没有找到相关记录'，**严禁**提及其他无关人物，**严禁**编造关系。"
         
         # 格式化结果供 LLM 阅读
         context_lines = ["【系统反馈】已找到以下相关记录：\n"]
