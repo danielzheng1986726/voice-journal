@@ -700,9 +700,10 @@ def chat_with_agent(user_message: str, conversation_history: Optional[List[Dict[
     # --- 第一轮：思考与决策 (Reasoning) ---
     try:
         response = client.chat.completions.create(
-            model="supermind-agent-v1",
+            model="gpt-5",
             messages=messages,
-            temperature=0.1  # 降低温度，让指令更精准
+            # gpt-5 在 Builder Space 中仅支持 temperature=1.0
+            temperature=1.0
         )
         ai_response = response.choices[0].message.content.strip()
         logger.info(f"🤖 AI (思考): {ai_response[:200]}...")
@@ -761,9 +762,10 @@ def chat_with_agent(user_message: str, conversation_history: Optional[List[Dict[
         # 4. 让 AI 根据资料生成最终回答
         try:
             final_response = client.chat.completions.create(
-                model="supermind-agent-v1",
+                model="gpt-5",
                 messages=messages,
-                temperature=0.7
+                # gpt-5 在 Builder Space 中仅支持 temperature=1.0
+                temperature=1.0
             )
             final_answer = final_response.choices[0].message.content.strip()
             logger.info(f"✅ [ReAct] 最终回答生成成功，长度: {len(final_answer)} 字符")

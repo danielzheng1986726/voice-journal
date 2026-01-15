@@ -193,17 +193,474 @@ def save_records(records):
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    """显示最近的记录"""
-    records = load_records()
+    """ChatGPT 风格的数字记忆助手界面"""
+    html = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Digital Memory - 你的数字记忆助手</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            height: 100vh;
+            display: flex;
+            background: #343541;
+            color: #ececf1;
+        }
+        
+        .sidebar {
+            width: 260px;
+            background: #202123;
+            display: flex;
+            flex-direction: column;
+            padding: 10px;
+        }
+        
+        .new-chat-btn {
+            padding: 12px;
+            border: 1px solid #565869;
+            border-radius: 5px;
+            background: transparent;
+            color: #ececf1;
+            cursor: pointer;
+            margin-bottom: 10px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .new-chat-btn:hover {
+            background: #2a2b32;
+        }
+        
+        .chat-history {
+            flex: 1;
+            overflow-y: auto;
+        }
+        
+        .chat-history-item {
+            padding: 10px;
+            border-radius: 5px;
+            cursor: pointer;
+            margin-bottom: 5px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        
+        .chat-history-item:hover {
+            background: #2a2b32;
+        }
+        
+        .main-content {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .chat-messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 20px;
+        }
+        
+        .message {
+            max-width: 800px;
+            margin: 0 auto 20px;
+            padding: 20px;
+            line-height: 1.6;
+        }
+        
+        .message.user {
+            background: #343541;
+        }
+        
+        .message.assistant {
+            background: #444654;
+            border-radius: 5px;
+        }
+        
+        .message-role {
+            font-weight: bold;
+            margin-bottom: 10px;
+            font-size: 14px;
+        }
+        
+        .input-area {
+            padding: 20px;
+            background: #343541;
+        }
+        
+        .input-container {
+            max-width: 800px;
+            margin: 0 auto;
+            display: flex;
+            align-items: flex-end;
+            gap: 10px;
+            background: #40414f;
+            border-radius: 10px;
+            padding: 10px 15px;
+        }
+        
+        .input-box {
+            flex: 1;
+            background: transparent;
+            border: none;
+            color: #ececf1;
+            font-size: 16px;
+            resize: none;
+            max-height: 200px;
+            outline: none;
+        }
+        
+        .input-box::placeholder {
+            color: #8e8ea0;
+        }
+        
+        .voice-btn, .send-btn {
+            width: 40px;
+            height: 40px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 18px;
+        }
+        
+        .voice-btn {
+            background: transparent;
+            color: #8e8ea0;
+        }
+        
+        .voice-btn:hover {
+            color: #ececf1;
+        }
+        
+        .voice-btn.recording {
+            background: #ef4444;
+            color: white;
+            animation: pulse 1.5s infinite;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        
+        .send-btn {
+            background: #19c37d;
+            color: white;
+        }
+        
+        .send-btn:hover {
+            background: #1a7f5a;
+        }
+        
+        .send-btn:disabled {
+            background: #40414f;
+            color: #8e8ea0;
+            cursor: not-allowed;
+        }
+        
+        .menu-btn {
+            display: none;
+            position: fixed;
+            top: 10px;
+            left: 10px;
+            z-index: 100;
+            background: #202123;
+            border: none;
+            color: #ececf1;
+            padding: 10px;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+        
+        @media (max-width: 768px) {
+            .sidebar {
+                position: fixed;
+                left: -260px;
+                top: 0;
+                bottom: 0;
+                z-index: 99;
+                transition: left 0.3s;
+            }
+            
+            .sidebar.open {
+                left: 0;
+            }
+            
+            .menu-btn {
+                display: block;
+            }
+            
+            .message {
+                padding: 15px;
+            }
+            
+            .input-container {
+                padding: 8px 12px;
+            }
+            
+            .input-box {
+                font-size: 16px;
+            }
+        }
+        
+        .typing-indicator {
+            display: flex;
+            gap: 5px;
+            padding: 20px;
+        }
+        
+        .typing-indicator span {
+            width: 8px;
+            height: 8px;
+            background: #8e8ea0;
+            border-radius: 50%;
+            animation: typing 1.4s infinite;
+        }
+        
+        .typing-indicator span:nth-child(2) {
+            animation-delay: 0.2s;
+        }
+        
+        .typing-indicator span:nth-child(3) {
+            animation-delay: 0.4s;
+        }
+        
+        @keyframes typing {
+            0%, 60%, 100% { transform: translateY(0); }
+            30% { transform: translateY(-10px); }
+        }
+    </style>
+</head>
+<body>
+    <button class="menu-btn" onclick="toggleSidebar()">☰</button>
     
-    # 按时间倒序排序（最新的在前）
-    records.sort(key=lambda x: (x.get('date', ''), x.get('time', '')), reverse=True)
+    <aside class="sidebar" id="sidebar">
+        <button class="new-chat-btn" onclick="newChat()">
+            <span>+</span> 新对话
+        </button>
+        <div class="chat-history" id="chatHistory">
+        </div>
+    </aside>
     
-    # 只显示最近 10 条
-    recent_records = records[:10]
-    
-    # 生成 HTML
-    html = f"""
+    <main class="main-content">
+        <div class="chat-messages" id="chatMessages">
+            <div class="message assistant">
+                <div class="message-role">🤖 AI 助手</div>
+                <div class="message-content">
+                    你好！我是你的数字记忆助手。你可以和我聊天，我会记住我们的对话。
+                    以后你可以问我「我之前说过什么」，我会帮你找到。
+                </div>
+            </div>
+        </div>
+        
+        <div class="input-area">
+            <div class="input-container">
+                <textarea 
+                    class="input-box" 
+                    id="inputBox" 
+                    placeholder="输入消息，或点击麦克风语音输入..."
+                    rows="1"
+                    onkeydown="handleKeyDown(event)"
+                    oninput="autoResize(this)"
+                ></textarea>
+                <button class="voice-btn" id="voiceBtn" onclick="toggleVoice()">🎤</button>
+                <button class="send-btn" id="sendBtn" onclick="sendMessage()">➤</button>
+            </div>
+        </div>
+    </main>
+
+    <script>
+        let isRecording = false;
+        let recognition = null;
+        
+        function initSpeechRecognition() {
+            if ('webkitSpeechRecognition' in window) {
+                recognition = new webkitSpeechRecognition();
+                recognition.continuous = true;
+                recognition.interimResults = true;
+                recognition.lang = 'zh-CN';
+                
+                recognition.onresult = (event) => {
+                    let transcript = '';
+                    for (let i = event.resultIndex; i < event.results.length; i++) {
+                        transcript += event.results[i][0].transcript;
+                    }
+                    document.getElementById('inputBox').value = transcript;
+                    autoResize(document.getElementById('inputBox'));
+                };
+                
+                recognition.onerror = (event) => {
+                    console.error('语音识别错误:', event.error);
+                    stopRecording();
+                };
+            }
+        }
+        
+        function toggleVoice() {
+            if (isRecording) {
+                stopRecording();
+            } else {
+                startRecording();
+            }
+        }
+        
+        function startRecording() {
+            if (!recognition) {
+                initSpeechRecognition();
+            }
+            if (recognition) {
+                recognition.start();
+                isRecording = true;
+                document.getElementById('voiceBtn').classList.add('recording');
+            }
+        }
+        
+        function stopRecording() {
+            if (recognition) {
+                recognition.stop();
+            }
+            isRecording = false;
+            document.getElementById('voiceBtn').classList.remove('recording');
+        }
+        
+        async function sendMessage() {
+            const inputBox = document.getElementById('inputBox');
+            const message = inputBox.value.trim();
+            
+            if (!message) return;
+            
+            if (isRecording) stopRecording();
+            
+            addMessage('user', message);
+            inputBox.value = '';
+            autoResize(inputBox);
+            
+            showTypingIndicator();
+            
+            try {
+                const response = await fetch('/api/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message: message })
+                });
+                
+                const data = await response.json();
+                
+                hideTypingIndicator();
+                
+                addMessage('assistant', data.response);
+                
+                await saveToMemory(message, data.response);
+                
+            } catch (error) {
+                hideTypingIndicator();
+                addMessage('assistant', '抱歉，发生了错误。请稍后再试。');
+                console.error('Error:', error);
+            }
+        }
+        
+        function addMessage(role, content) {
+            const messagesDiv = document.getElementById('chatMessages');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'message ' + role;
+            messageDiv.innerHTML = 
+                '<div class="message-role">' + (role === 'user' ? '👤 你' : '🤖 AI 助手') + '</div>' +
+                '<div class="message-content">' + formatContent(content) + '</div>';
+            messagesDiv.appendChild(messageDiv);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+        
+        function formatContent(content) {
+            return content
+                .replace(/\\n/g, '<br>')
+                .replace(/\\*\\*(.*?)\\*\\*/g, '<strong>$1</strong>')
+                .replace(/\\*(.*?)\\*/g, '<em>$1</em>');
+        }
+        
+        function showTypingIndicator() {
+            const messagesDiv = document.getElementById('chatMessages');
+            const indicator = document.createElement('div');
+            indicator.id = 'typingIndicator';
+            indicator.className = 'message assistant';
+            indicator.innerHTML = 
+                '<div class="message-role">🤖 AI 助手</div>' +
+                '<div class="typing-indicator">' +
+                '<span></span><span></span><span></span>' +
+                '</div>';
+            messagesDiv.appendChild(indicator);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+        
+        function hideTypingIndicator() {
+            const indicator = document.getElementById('typingIndicator');
+            if (indicator) indicator.remove();
+        }
+        
+        async function saveToMemory(userMessage, aiResponse) {
+            try {
+                await fetch('/api/voice', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        content: '[对话] 我说：' + userMessage
+                    })
+                });
+                
+                await fetch('/api/voice', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        content: '[对话] AI 回复：' + aiResponse
+                    })
+                });
+            } catch (error) {
+                console.error('保存记忆失败:', error);
+            }
+        }
+        
+        function newChat() {
+            document.getElementById('chatMessages').innerHTML = 
+                '<div class="message assistant">' +
+                '<div class="message-role">🤖 AI 助手</div>' +
+                '<div class="message-content">' +
+                '你好！我是你的数字记忆助手。你可以和我聊天，我会记住我们的对话。' +
+                '</div></div>';
+        }
+        
+        function toggleSidebar() {
+            document.getElementById('sidebar').classList.toggle('open');
+        }
+        
+        function autoResize(textarea) {
+            textarea.style.height = 'auto';
+            textarea.style.height = Math.min(textarea.scrollHeight, 200) + 'px';
+        }
+        
+        function handleKeyDown(event) {
+            if (event.key === 'Enter' && !event.shiftKey) {
+                event.preventDefault();
+                sendMessage();
+            }
+        }
+        
+        initSpeechRecognition();
+    </script>
+</body>
+</html>"""
+    return html
     <!DOCTYPE html>
     <html lang="zh-CN">
     <head>
