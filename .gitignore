@@ -1,0 +1,26 @@
+# 环境变量
+.env
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 敏感数据文件 - 绝对不能公开
+all_chunks.json
+chunks_metadata.json
+voice_records.json
+*.index
+.indexed_ids.json
+
+# 日志
+*.log
+logs/
+
+# 其他
+.need_reindex
+.index_status.json
+.DS_Store
+.venv/
+venv/
+*.swp
+*.swo
