@@ -9,6 +9,7 @@ __pycache__/
 all_chunks.json
 chunks_metadata.json
 voice_records.json
+conversations.json
 *.index
 .indexed_ids.json
 

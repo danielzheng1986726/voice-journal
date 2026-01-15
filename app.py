@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Voice Journal")
 
 RECORDS_FILE = Path(__file__).parent / "voice_records.json"
+CONVERSATIONS_FILE = Path(__file__).parent / "conversations.json"
 
 # RAG 相关配置（使用相对路径，所有文件都在 vector_indexer 目录下）
 VECTOR_INDEXER_DIR = Path(__file__).parent  # 当前目录就是 vector_indexer
@@ -159,22 +160,27 @@ def sync_to_rag_system(voice_record):
 class VoiceRecordRequest(BaseModel):
     """语音记录请求模型"""
     content: str
+    conversation_id: str | None = None
 
 def generate_id():
     """生成唯一 ID，格式：voice_YYYYMMDD_HHMM"""
     now = datetime.now()
     return f"voice_{now.strftime('%Y%m%d_%H%M')}"
 
-def create_record(content: str):
+def create_record(content: str, conversation_id: str | None = None):
     """创建一条记录"""
     now = datetime.now()
-    return {
+    record = {
         "id": generate_id(),
         "source": "voice",
         "date": now.strftime("%Y-%m-%d"),
         "time": now.strftime("%H:%M"),
-        "content": content
+        "content": content,
     }
+    # 仅当提供会话 ID 时才写入字段，兼容旧数据
+    if conversation_id:
+        record["conversation_id"] = conversation_id
+    return record
 
 def load_records():
     """加载记录"""
@@ -190,6 +196,23 @@ def save_records(records):
     """保存记录到文件"""
     with open(RECORDS_FILE, 'w', encoding='utf-8') as f:
         json.dump(records, f, ensure_ascii=False, indent=2)
+
+
+def load_conversations() -> list[dict]:
+    """加载会话列表"""
+    if CONVERSATIONS_FILE.exists():
+        try:
+            with open(CONVERSATIONS_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return []
+    return []
+
+
+def save_conversations(conversations: list[dict]) -> None:
+    """保存会话列表"""
+    with open(CONVERSATIONS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(conversations, f, ensure_ascii=False, indent=2)
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
@@ -442,6 +465,11 @@ async def index():
             0%, 60%, 100% { transform: translateY(0); }
             30% { transform: translateY(-10px); }
         }
+
+        .chat-history-item.active {
+            background: #343541;
+            border-left: 3px solid #19c37d;
+        }
     </style>
 </head>
 <body>
@@ -483,259 +511,316 @@ async def index():
     </main>
 
     <script>
-        let isRecording = false;
-        let recognition = null;
-        let finalTranscript = '';  // 累积最终文本，解决停顿后内容丢失问题
+// 状态管理
+let isRecording = false;
+let recognition = null;
+let finalTranscript = '';
+let currentConversationId = null;
+
+// 初始化语音识别
+function initSpeechRecognition() {
+    if ('webkitSpeechRecognition' in window) {
+        recognition = new webkitSpeechRecognition();
+        recognition.continuous = true;
+        recognition.interimResults = true;
+        recognition.lang = 'zh-CN';
         
-        // 初始化语音识别
-        function initSpeechRecognition() {
-            if ('webkitSpeechRecognition' in window) {
-                recognition = new webkitSpeechRecognition();
-                recognition.continuous = true;
-                recognition.interimResults = true;
-                recognition.lang = 'zh-CN';
-                
-                recognition.onresult = (event) => {
-                    let interimTranscript = '';
-                    for (let i = event.resultIndex; i < event.results.length; i++) {
-                        const result = event.results[i];
-                        const text = result[0].transcript;
-                        if (result.isFinal) {
-                            finalTranscript += text;
-                        } else {
-                            interimTranscript += text;
-                        }
-                    }
-                    const inputBox = document.getElementById('inputBox');
-                    inputBox.value = finalTranscript + interimTranscript;
-                    autoResize(inputBox);
-                };
-                
-                recognition.onend = () => {
-                    // 如果还在录音状态（只是用户停顿），自动重启识别
-                    if (isRecording) {
-                        try {
-                            recognition.start();
-                        } catch (e) {
-                            console.error('重启语音识别失败:', e);
-                            stopRecording();
-                        }
-                    }
-                };
-                
-                recognition.onerror = (event) => {
-                    console.error('语音识别错误:', event.error);
-                    // no-speech 只是没听到声音，不立即结束整次录音
-                    if (event.error !== 'no-speech') {
-                        stopRecording();
-                    }
-                };
+        recognition.onresult = (event) => {
+            let interimTranscript = '';
+            for (let i = event.resultIndex; i < event.results.length; i++) {
+                if (event.results[i].isFinal) {
+                    finalTranscript += event.results[i][0].transcript;
+                } else {
+                    interimTranscript += event.results[i][0].transcript;
+                }
             }
-        }
+            document.getElementById('inputBox').value = finalTranscript + interimTranscript;
+            autoResize(document.getElementById('inputBox'));
+        };
         
-        function toggleVoice() {
+        recognition.onend = () => {
             if (isRecording) {
+                recognition.start();
+            }
+        };
+        
+        recognition.onerror = (event) => {
+            console.error('语音识别错误:', event.error);
+            if (event.error !== 'no-speech') {
                 stopRecording();
-            } else {
-                startRecording();
             }
+        };
+    }
+}
+
+function toggleVoice() {
+    if (isRecording) {
+        stopRecording();
+    } else {
+        startRecording();
+    }
+}
+
+function startRecording() {
+    if (!recognition) {
+        initSpeechRecognition();
+    }
+    if (recognition) {
+        finalTranscript = '';
+        recognition.start();
+        isRecording = true;
+        document.getElementById('voiceBtn').classList.add('recording');
+    }
+}
+
+function stopRecording() {
+    isRecording = false;
+    if (recognition) {
+        recognition.stop();
+    }
+    document.getElementById('voiceBtn').classList.remove('recording');
+}
+
+// 发送消息
+async function sendMessage() {
+    const inputBox = document.getElementById('inputBox');
+    const message = inputBox.value.trim();
+    
+    if (!message) return;
+    if (isRecording) stopRecording();
+    
+    // 如果没有当前会话，先创建一个
+    if (!currentConversationId) {
+        await createNewConversation();
+    }
+    
+    addMessage('user', message);
+    inputBox.value = '';
+    finalTranscript = '';
+    autoResize(inputBox);
+    
+    showTypingIndicator();
+    
+    try {
+        const response = await fetch('/api/chat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ message: message })
+        });
+        
+        const data = await response.json();
+        hideTypingIndicator();
+        addMessage('assistant', data.response);
+        
+        // 保存到记忆，关联会话ID
+        await saveToMemory(message, data.response);
+        
+        // 刷新左侧会话列表
+        await loadConversations();
+        
+    } catch (error) {
+        hideTypingIndicator();
+        addMessage('assistant', '抱歉，发生了错误。请稍后再试。');
+        console.error('Error:', error);
+    }
+}
+
+function addMessage(role, content) {
+    const messagesDiv = document.getElementById('chatMessages');
+    const messageDiv = document.createElement('div');
+    messageDiv.className = 'message ' + role;
+    messageDiv.innerHTML = 
+        '<div class="message-role">' + (role === 'user' ? '👤 你' : '🤖 AI 助手') + '</div>' +
+        '<div class="message-content">' + formatContent(content) + '</div>';
+    messagesDiv.appendChild(messageDiv);
+    messagesDiv.scrollTop = messagesDiv.scrollHeight;
+}
+
+function formatContent(content) {
+    return content
+        .replace(/\\n/g, '<br>')
+        .replace(/\n/g, '<br>')
+        .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+        .replace(/\*(.*?)\*/g, '<em>$1</em>');
+}
+
+function showTypingIndicator() {
+    const messagesDiv = document.getElementById('chatMessages');
+    const indicator = document.createElement('div');
+    indicator.id = 'typingIndicator';
+    indicator.className = 'message assistant';
+    indicator.innerHTML = 
+        '<div class="message-role">🤖 AI 助手</div>' +
+        '<div class="typing-indicator"><span></span><span></span><span></span></div>';
+    messagesDiv.appendChild(indicator);
+    messagesDiv.scrollTop = messagesDiv.scrollHeight;
+}
+
+function hideTypingIndicator() {
+    const indicator = document.getElementById('typingIndicator');
+    if (indicator) indicator.remove();
+}
+
+// 保存到记忆，关联会话ID
+async function saveToMemory(userMessage, aiResponse) {
+    try {
+        await fetch('/api/voice', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                content: '[对话] 我说：' + userMessage,
+                conversation_id: currentConversationId
+            })
+        });
+        
+        await fetch('/api/voice', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                content: '[对话] AI 回复：' + aiResponse,
+                conversation_id: currentConversationId
+            })
+        });
+    } catch (error) {
+        console.error('保存记忆失败:', error);
+    }
+}
+
+// 创建新会话
+async function createNewConversation() {
+    try {
+        const response = await fetch('/api/conversations', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' }
+        });
+        const conv = await response.json();
+        currentConversationId = conv.id;
+        await loadConversations();
+        return conv;
+    } catch (error) {
+        console.error('创建会话失败:', error);
+    }
+}
+
+// 新对话按钮
+async function newChat() {
+    currentConversationId = null;
+    
+    document.getElementById('chatMessages').innerHTML = 
+        '<div class="message assistant">' +
+        '<div class="message-role">🤖 AI 助手</div>' +
+        '<div class="message-content">' +
+        '你好！我是你的数字记忆助手。你可以和我聊天，我会记住我们的对话。' +
+        '</div></div>';
+    
+    document.querySelectorAll('.chat-history-item').forEach(item => {
+        item.classList.remove('active');
+    });
+}
+
+// 加载会话列表
+async function loadConversations() {
+    try {
+        const response = await fetch('/api/conversations');
+        const data = await response.json();
+        const conversations = data.conversations || [];
+        
+        const historyDiv = document.getElementById('chatHistory');
+        historyDiv.innerHTML = '';
+        
+        if (conversations.length === 0) {
+            historyDiv.innerHTML = '<div style="color: #8e8ea0; padding: 10px; font-size: 14px;">暂无历史记录</div>';
+            return;
         }
         
-        function startRecording() {
-            if (!recognition) {
-                initSpeechRecognition();
+        conversations.forEach(conv => {
+            const item = document.createElement('div');
+            item.className = 'chat-history-item';
+            if (conv.id === currentConversationId) {
+                item.classList.add('active');
             }
-            if (recognition) {
-                // 开始新一轮录音时清空累积文本
-                finalTranscript = '';
-                try {
-                    recognition.start();
-                    isRecording = true;
-                    document.getElementById('voiceBtn').classList.add('recording');
-                } catch (e) {
-                    console.error('启动语音识别失败:', e);
-                }
-            }
-        }
-        
-        function stopRecording() {
-            // 先标记状态，避免 onend 中再次自动重启
-            isRecording = false;
-            if (recognition) {
-                try {
-                    recognition.stop();
-                } catch (e) {
-                    console.error('停止语音识别失败:', e);
-                }
-            }
-            document.getElementById('voiceBtn').classList.remove('recording');
-        }
-        
-        async function sendMessage() {
-            const inputBox = document.getElementById('inputBox');
-            const message = inputBox.value.trim();
             
-            if (!message) return;
+            item.textContent = conv.title || '新对话';
+            item.title = (conv.created_at || '') + ' (' + (conv.message_count || 0) + '条消息)';
+            item.setAttribute('data-conv-id', conv.id);
+            item.onclick = function() { loadConversation(conv.id, this); };
             
-            if (isRecording) stopRecording();
-            
-            addMessage('user', message);
-            inputBox.value = '';
-            autoResize(inputBox);
-            
-            showTypingIndicator();
-            
-            try {
-                const response = await fetch('/api/chat', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ message: message })
-                });
-                
-                const data = await response.json();
-                
-                hideTypingIndicator();
-                
-                addMessage('assistant', data.response);
-                
-                await saveToMemory(message, data.response);
-                
-            } catch (error) {
-                hideTypingIndicator();
-                addMessage('assistant', '抱歉，发生了错误。请稍后再试。');
-                console.error('Error:', error);
-            }
+            historyDiv.appendChild(item);
+        });
+    } catch (error) {
+        console.error('加载会话列表失败:', error);
+    }
+}
+
+// 加载特定会话
+async function loadConversation(convId, clickedItem) {
+    try {
+        currentConversationId = convId;
+        
+        // 更新高亮
+        document.querySelectorAll('.chat-history-item').forEach(item => {
+            item.classList.remove('active');
+        });
+        if (clickedItem) {
+            clickedItem.classList.add('active');
         }
         
-        function addMessage(role, content) {
-            const messagesDiv = document.getElementById('chatMessages');
-            const messageDiv = document.createElement('div');
-            messageDiv.className = 'message ' + role;
-            messageDiv.innerHTML = 
-                '<div class="message-role">' + (role === 'user' ? '👤 你' : '🤖 AI 助手') + '</div>' +
-                '<div class="message-content">' + formatContent(content) + '</div>';
-            messagesDiv.appendChild(messageDiv);
-            messagesDiv.scrollTop = messagesDiv.scrollHeight;
-        }
+        // 获取会话消息
+        const response = await fetch('/api/conversations/' + convId + '/messages');
+        const data = await response.json();
+        const messages = data.messages || [];
         
-        function formatContent(content) {
-            return content
-                .replace(/\\n/g, '<br>')
-                .replace(/\\*\\*(.*?)\\*\\*/g, '<strong>$1</strong>')
-                .replace(/\\*(.*?)\\*/g, '<em>$1</em>');
-        }
+        // 清空并重新渲染聊天区域
+        const messagesDiv = document.getElementById('chatMessages');
+        messagesDiv.innerHTML = '';
         
-        function showTypingIndicator() {
-            const messagesDiv = document.getElementById('chatMessages');
-            const indicator = document.createElement('div');
-            indicator.id = 'typingIndicator';
-            indicator.className = 'message assistant';
-            indicator.innerHTML = 
-                '<div class="message-role">🤖 AI 助手</div>' +
-                '<div class="typing-indicator">' +
-                '<span></span><span></span><span></span>' +
-                '</div>';
-            messagesDiv.appendChild(indicator);
-            messagesDiv.scrollTop = messagesDiv.scrollHeight;
-        }
-        
-        function hideTypingIndicator() {
-            const indicator = document.getElementById('typingIndicator');
-            if (indicator) indicator.remove();
-        }
-        
-        async function saveToMemory(userMessage, aiResponse) {
-            try {
-                await fetch('/api/voice', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        content: '[对话] 我说：' + userMessage
-                    })
-                });
-                
-                await fetch('/api/voice', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        content: '[对话] AI 回复：' + aiResponse
-                    })
-                });
-            } catch (error) {
-                console.error('保存记忆失败:', error);
-            }
-        }
-        
-        function newChat() {
-            document.getElementById('chatMessages').innerHTML = 
+        if (messages.length === 0) {
+            messagesDiv.innerHTML = 
                 '<div class="message assistant">' +
                 '<div class="message-role">🤖 AI 助手</div>' +
-                '<div class="message-content">' +
-                '你好！我是你的数字记忆助手。你可以和我聊天，我会记住我们的对话。' +
-                '</div></div>';
+                '<div class="message-content">这个会话还没有消息。</div></div>';
+            return;
         }
         
-        function toggleSidebar() {
-            document.getElementById('sidebar').classList.toggle('open');
-        }
-        
-        function autoResize(textarea) {
-            textarea.style.height = 'auto';
-            textarea.style.height = Math.min(textarea.scrollHeight, 200) + 'px';
-        }
-        
-        function handleKeyDown(event) {
-            if (event.key === 'Enter' && !event.shiftKey) {
-                event.preventDefault();
-                sendMessage();
+        messages.forEach(msg => {
+            if (msg.content && msg.content.startsWith('[对话] 我说：')) {
+                addMessage('user', msg.content.replace('[对话] 我说：', ''));
+            } else if (msg.content && msg.content.startsWith('[对话] AI 回复：')) {
+                addMessage('assistant', msg.content.replace('[对话] AI 回复：', ''));
             }
-        }
-        
-        // 加载左侧历史记忆（最近 20 条带 [对话] 前缀的记录）
-        async function loadChatHistory() {
-            try {
-                const response = await fetch('/api/records');
-                const data = await response.json();
-                const records = (data && data.records) ? data.records : [];
-                
-                const historyDiv = document.getElementById('chatHistory');
-                historyDiv.innerHTML = '';
-                
-                const chatRecords = records
-                    .filter(r => r.content && r.content.startsWith('[对话]'))
-                    .slice(-20)
-                    .reverse();
-                
-                if (chatRecords.length === 0) {
-                    historyDiv.innerHTML = '<div style="color: #8e8ea0; padding: 10px; font-size: 14px;">暂无历史记录</div>';
-                    return;
-                }
-                
-                chatRecords.forEach(record => {
-                    const item = document.createElement('div');
-                    item.className = 'chat-history-item';
-                    let summary = record.content
-                        .replace('[对话] 我说：', '')
-                        .replace('[对话] AI 回复：', '');
-                    if (summary.length > 30) {
-                        summary = summary.substring(0, 30) + '...';
-                    }
-                    item.textContent = summary;
-                    const date = record.date || '';
-                    const time = record.time || '';
-                    item.title = (date + ' ' + time).trim();
-                    historyDiv.appendChild(item);
-                });
-            } catch (error) {
-                console.error('加载历史记录失败:', error);
-            }
-        }
-        
-        // 页面加载完成后初始化语音识别并加载历史
-        document.addEventListener('DOMContentLoaded', () => {
-            initSpeechRecognition();
-            loadChatHistory();
         });
+        
+        // 手机端自动关闭侧边栏
+        if (window.innerWidth <= 768) {
+            document.getElementById('sidebar').classList.remove('open');
+        }
+        
+    } catch (error) {
+        console.error('加载会话失败:', error);
+    }
+}
+
+function toggleSidebar() {
+    document.getElementById('sidebar').classList.toggle('open');
+}
+
+function autoResize(textarea) {
+    textarea.style.height = 'auto';
+    textarea.style.height = Math.min(textarea.scrollHeight, 200) + 'px';
+}
+
+function handleKeyDown(event) {
+    if (event.key === 'Enter' && !event.shiftKey) {
+        event.preventDefault();
+        sendMessage();
+    }
+}
+
+// 页面加载完成
+document.addEventListener('DOMContentLoaded', () => {
+    initSpeechRecognition();
+    loadConversations();
+});
     </script>
 </body>
 </html>"""
@@ -748,6 +833,72 @@ async def get_records():
     records.sort(key=lambda x: (x.get('date', ''), x.get('time', '')), reverse=True)
     return {"total": len(records), "records": records}
 
+
+@app.get("/api/conversations")
+async def get_conversations():
+    """获取所有会话列表（按更新时间倒序）"""
+    conversations = load_conversations()
+    conversations.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
+    return {"conversations": conversations}
+
+
+@app.post("/api/conversations")
+async def create_conversation():
+    """创建新会话"""
+    now = datetime.now()
+    conv_id = f"conv_{now.strftime('%Y%m%d_%H%M%S')}"
+    iso_now = now.isoformat()
+
+    new_conv = {
+        "id": conv_id,
+        "title": "新对话",
+        "created_at": iso_now,
+        "updated_at": iso_now,
+        "message_count": 0,
+    }
+
+    conversations = load_conversations()
+    conversations.append(new_conv)
+    save_conversations(conversations)
+
+    return new_conv
+
+
+@app.get("/api/conversations/{conv_id}/messages")
+async def get_conversation_messages(conv_id: str):
+    """获取特定会话的所有消息"""
+    records = load_records()
+    messages = [r for r in records if r.get("conversation_id") == conv_id]
+    # 按记录 id 排序（包含时间信息）
+    messages.sort(key=lambda x: x.get("id", ""))
+    return {"messages": messages}
+
+
+class ConversationUpdate(BaseModel):
+    """会话更新模型（目前仅支持标题）"""
+    title: str | None = None
+
+
+@app.put("/api/conversations/{conv_id}")
+async def update_conversation(conv_id: str, data: ConversationUpdate):
+    """更新会话信息（如标题）"""
+    conversations = load_conversations()
+    updated = False
+
+    for conv in conversations:
+        if conv.get("id") == conv_id:
+            if data.title is not None:
+                conv["title"] = data.title
+            conv["updated_at"] = datetime.now().isoformat()
+            updated = True
+            break
+
+    if not updated:
+        raise HTTPException(status_code=404, detail="会话不存在")
+
+    save_conversations(conversations)
+    return {"status": "ok"}
+
 @app.post("/api/voice")
 async def add_voice_record(request: VoiceRecordRequest):
     """
@@ -756,15 +907,34 @@ async def add_voice_record(request: VoiceRecordRequest):
     """
     if not request.content or not request.content.strip():
         raise HTTPException(status_code=400, detail="内容不能为空")
-    
-    # 创建新记录
-    record = create_record(request.content.strip())
+
+    content = request.content.strip()
+    conversation_id = request.conversation_id
+
+    # 创建新记录（可带会话 ID）
+    record = create_record(content, conversation_id=conversation_id)
     
     # 加载现有记录并追加
     records = load_records()
     records.append(record)
     save_records(records)
     
+    # 如果有会话 ID，更新会话的消息数与标题
+    if conversation_id:
+        conversations = load_conversations()
+        for conv in conversations:
+            if conv.get("id") == conversation_id:
+                conv["message_count"] = conv.get("message_count", 0) + 1
+                conv["updated_at"] = datetime.now().isoformat()
+                # 如果是默认标题且是用户发言，可以用内容更新标题
+                if conv.get("title") == "新对话" and content.startswith("[对话] 我说："):
+                    raw = content.replace("[对话] 我说：", "").strip()
+                    title = raw[:25] + ("..." if len(raw) > 25 else "")
+                    if title:
+                        conv["title"] = title
+                break
+        save_conversations(conversations)
+
     # 同步到RAG系统
     try:
         sync_to_rag_system(record)
