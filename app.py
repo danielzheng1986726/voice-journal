@@ -9,14 +9,16 @@ import json
 import os
 import logging
 import subprocess
+import re
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
-from datetime import datetime
+from datetime import datetime, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from dotenv import load_dotenv
+from openai import OpenAI
 
 # 加载环境变量
 load_dotenv()
@@ -29,6 +31,7 @@ app = FastAPI(title="Voice Journal")
 
 RECORDS_FILE = Path(__file__).parent / "voice_records.json"
 CONVERSATIONS_FILE = Path(__file__).parent / "conversations.json"
+SCAN_RESULTS_FILE = Path(__file__).parent / "scan_results.json"
 
 # RAG 相关配置（使用相对路径，所有文件都在 vector_indexer 目录下）
 VECTOR_INDEXER_DIR = Path(__file__).parent  # 当前目录就是 vector_indexer
@@ -72,6 +75,56 @@ except Exception as e:
 scheduler = BackgroundScheduler()
 scheduler.start()
 logger.info("✅ 定时任务调度器已启动")
+
+def auto_scan():
+    """
+    自动扫描函数（定时任务调用）
+    执行扫描并将结果保存到 scan_results.json
+    """
+    try:
+        logger.info("🔄 [自动扫描] 开始定时扫描...")
+        result = _perform_scan()
+        
+        # 保存结果到文件
+        scan_result = {
+            "scan_time": datetime.now().isoformat(),
+            "result": result,
+            "trigger": "auto"  # 标记为自动触发
+        }
+        
+        with open(SCAN_RESULTS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(scan_result, f, ensure_ascii=False, indent=2)
+        
+        if "error" in result:
+            logger.warning(f"⚠️  [自动扫描] 扫描完成，但有错误: {result.get('error', '未知错误')}")
+        else:
+            patterns_count = len(result.get('deep_dive_report', {}).get('patterns', []))
+            logger.info(f"✅ [自动扫描] 定时扫描完成，识别到 {patterns_count} 个模式")
+            
+    except Exception as e:
+        logger.exception(f"❌ [自动扫描] 定时扫描异常: {e}")
+        # 即使出错也保存错误信息
+        try:
+            scan_result = {
+                "scan_time": datetime.now().isoformat(),
+                "result": {
+                    "error": f"扫描过程出现异常: {str(e)}"
+                }
+            }
+            with open(SCAN_RESULTS_FILE, 'w', encoding='utf-8') as f:
+                json.dump(scan_result, f, ensure_ascii=False, indent=2)
+        except Exception as save_error:
+            logger.error(f"❌ [自动扫描] 保存错误信息失败: {save_error}")
+
+# 添加定时扫描任务（每小时一次）
+scheduler.add_job(
+    auto_scan,
+    trigger=IntervalTrigger(hours=1),
+    id='auto_scan_job',
+    name='每小时自动扫描',
+    replace_existing=True
+)
+logger.info("✅ 已启动定时扫描任务（每小时一次）")
 
 # 对话历史存储（简单的内存存储，实际应用可以使用 Redis 等）
 conversation_histories = {}
@@ -397,6 +450,36 @@ async def index():
             cursor: not-allowed;
         }
         
+        .settings-btn {
+            position: fixed;
+            top: 15px;
+            right: 15px;
+            width: 36px;
+            height: 36px;
+            border: none;
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.1);
+            color: #8e8ea0;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s;
+            z-index: 100;
+        }
+        
+        .settings-btn:hover {
+            background: rgba(255, 255, 255, 0.2);
+            color: #ececf1;
+        }
+        
+        @media (max-width: 768px) {
+            .settings-btn {
+                top: 10px;
+                right: 50px;
+            }
+        }
+        
         .menu-btn {
             display: none;
             position: fixed;
@@ -501,6 +584,12 @@ async def index():
 </head>
 <body>
     <button class="menu-btn" onclick="toggleSidebar()">☰</button>
+    <button class="settings-btn" onclick="window.location.href='/admin'" title="管理设置">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="3"/>
+            <path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/>
+        </svg>
+    </button>
     
     <aside class="sidebar" id="sidebar">
         <button class="new-chat-btn" onclick="newChat()">
@@ -513,10 +602,10 @@ async def index():
     <main class="main-content">
         <div class="chat-messages" id="chatMessages">
             <div class="message assistant">
-                <div class="message-role">🤖 AI 助手</div>
+                <div class="message-role">🤖 Digital Twin</div>
                 <div class="message-content">
-                    你好！我是你的数字记忆助手。你可以和我聊天，我会记住我们的对话。
-                    以后你可以问我「我之前说过什么」，我会帮你找到。
+                    你好！我是你的数字记忆助手。你可以用文字或语音和我对话，我会记住我们的交流。<br><br>
+                    试试问我：「最近两天我说了什么」或「帮我回忆上个月的事」
                 </div>
             </div>
         </div>
@@ -531,7 +620,13 @@ async def index():
                     onkeydown="handleKeyDown(event)"
                     oninput="autoResize(this)"
                 ></textarea>
-                <button class="voice-btn" id="voiceBtn" onclick="toggleVoice()">🎤</button>
+                <button class="voice-btn" id="voiceBtn" onclick="toggleVoice()">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/>
+                        <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+                        <line x1="12" y1="19" x2="12" y2="22"/>
+                    </svg>
+                </button>
                 <button class="send-btn" id="sendBtn" onclick="sendMessage()">➤</button>
             </div>
         </div>
@@ -1235,6 +1330,7 @@ async def records_page():
                     <li><a href="/">🎤 录音</a></li>
                     <li><a href="/records" class="active">📝 记录</a></li>
                     <li><a href="/chat">🤖 智能对话</a></li>
+                    <li><a href="/scan">🔍 状态扫描</a></li>
                     <li><a href="/settings">⚙️ 设置</a></li>
                 </ul>
             </div>
@@ -1516,6 +1612,366 @@ async def chat_api(request: ChatRequest):
             error=str(e)
         )
 
+def _perform_scan():
+    """
+    执行扫描的核心逻辑（可复用）
+    
+    Returns:
+        dict: 扫描结果，格式为 {
+            "scan_period": "...",
+            "records_analyzed": int,
+            "deep_dive_report": {...}
+        } 或包含 "error" 字段的错误结果
+    """
+    try:
+        # ========== Stage 1: 数据收集 ==========
+        logger.info("🔍 [扫描] 开始执行个人状态监控扫描...")
+        
+        # 读取 voice_records.json
+        if not RECORDS_FILE.exists():
+            return {
+                "scan_period": None,
+                "records_analyzed": 0,
+                "error": "暂无语音记录文件，请先添加一些记录。"
+            }
+        
+        with open(RECORDS_FILE, 'r', encoding='utf-8') as f:
+            all_records = json.load(f)
+        
+        # 过滤最近 7 天的记录
+        today = datetime.now().date()
+        seven_days_ago = today - timedelta(days=7)
+        
+        recent_records = []
+        for record in all_records:
+            record_date_str = record.get('date', '')
+            if not record_date_str:
+                continue
+            
+            try:
+                record_date = datetime.strptime(record_date_str, '%Y-%m-%d').date()
+                if record_date >= seven_days_ago:
+                    recent_records.append(record)
+            except ValueError:
+                logger.warning(f"⚠️  无法解析日期格式: {record_date_str}")
+                continue
+        
+        # 按日期排序（从旧到新）
+        recent_records.sort(key=lambda x: x.get('date', ''))
+        
+        if not recent_records:
+            return {
+                "scan_period": f"{seven_days_ago} 至 {today}",
+                "records_analyzed": 0,
+                "error": f"最近 7 天（{seven_days_ago} 至 {today}）没有语音记录。"
+            }
+        
+        logger.info(f"📊 [扫描] 找到 {len(recent_records)} 条最近 7 天的记录")
+        
+        # ========== Stage 2: 深度分析 ==========
+        # 读取 background.md
+        background_file = VECTOR_INDEXER_DIR / "background.md"
+        if not background_file.exists():
+            return {
+                "error": "background.md 文件不存在，无法进行分析。"
+            }
+        
+        with open(background_file, 'r', encoding='utf-8') as f:
+            background_content = f.read()
+        
+        # 构造待分析数据（格式化记录）
+        records_text = []
+        for i, record in enumerate(recent_records, 1):
+            record_id = record.get('id', '')
+            record_date = record.get('date', '')
+            record_time = record.get('time', '')
+            record_content = record.get('content', '')
+            # 截断单条记录内容，避免过长（每条记录最多 500 字符）
+            if len(record_content) > 500:
+                record_content = record_content[:500] + "...[已截断]"
+            records_text.append(f"记录 {i} [ID: {record_id}, 日期: {record_date} {record_time}]:\n{record_content}\n")
+        
+        records_data = "\n".join(records_text)
+        
+        # 如果总内容太长，进行截断（保留最近的记录）
+        MAX_CONTENT_LENGTH = 8000  # 减少到 8000 字符，避免 prompt 过长占用太多 token
+        if len(records_data) > MAX_CONTENT_LENGTH:
+            logger.warning(f"⚠️  [扫描] 内容过长 ({len(records_data)} 字符)，截断到 {MAX_CONTENT_LENGTH} 字符")
+            # 保留最近的记录（从后往前截断）
+            records_data = records_data[-MAX_CONTENT_LENGTH:]
+            # 找到第一个完整的记录开始位置
+            first_newline = records_data.find('\n')
+            if first_newline > 0:
+                records_data = records_data[first_newline+1:]
+            records_data = f"[注意：由于内容过长，仅显示部分记录]\n{records_data}"
+        
+        # 构造 prompt（简化版本，减少 token 消耗）
+        analysis_prompt = f"""分析以下语音记录，识别情绪模式、工作压力、项目进展、人际关系问题。
+
+分析标准：
+{background_content}
+
+待分析记录：
+{records_data}
+
+要求：返回 JSON 格式，包含 patterns 数组和 summary 字符串。
+patterns 格式：{{"importance": "High|Medium|Low", "pattern": "描述", "evidence": "证据", "suggestion": "建议"}}
+
+只返回 JSON，不要其他文字。
+"""
+
+        # 调用 AI API
+        api_key = os.getenv("AI_BUILDER_TOKEN")
+        if not api_key:
+            return {
+                "error": "AI_BUILDER_TOKEN 未设置，无法进行分析。"
+            }
+        
+        client = OpenAI(
+            base_url="https://space.ai-builders.com/backend/v1",
+            api_key=api_key,
+            timeout=120.0,  # 增加超时时间到 120 秒
+            max_retries=3  # 最大重试 3 次
+        )
+        
+        logger.info(f"🤖 [扫描] 正在调用 AI API 进行深度分析...")
+        logger.info(f"   - Prompt 长度: {len(analysis_prompt)} 字符")
+        logger.info(f"   - 记录数量: {len(recent_records)} 条")
+        
+        try:
+            # 尝试使用不同的模型，优先使用 deepseek（更稳定，能处理超长 prompt）
+            models_to_try = ["deepseek", "gemini-2.5-pro", "gpt-5"]
+            
+            last_error = None
+            response = None
+            
+            for model_name in models_to_try:
+                try:
+                    logger.info(f"   尝试使用模型: {model_name}")
+                    response = client.chat.completions.create(
+                        model=model_name,
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": "你是个人状态监控分析师。只返回 JSON，格式：{{\"patterns\": [...], \"summary\": \"...\"}}。不要其他文字。"
+                            },
+                            {
+                                "role": "user",
+                                "content": analysis_prompt
+                            }
+                        ],
+                        temperature=0.7,
+                        max_tokens=4000  # 增加输出限制，确保有足够空间生成完整响应
+                    )
+                    logger.info(f"   ✅ 模型 {model_name} 调用成功")
+                    
+                    # 检查是否因为长度限制被截断
+                    if response.choices and len(response.choices) > 0:
+                        choice = response.choices[0]
+                        if choice.finish_reason == 'length':
+                            logger.warning("⚠️  [扫描] 响应被截断（达到 max_tokens 限制）")
+                            # 如果 content 为空，返回错误
+                            if not choice.message.content:
+                                return {
+                                    "error": "AI 响应被截断且内容为空。请减少分析的记录数量，或稍后重试。",
+                                    "details": f"prompt_tokens: {response.usage.prompt_tokens if hasattr(response, 'usage') else 'N/A'}, max_tokens: 4000, finish_reason: {choice.finish_reason}",
+                                    "suggestion": "尝试减少扫描天数或记录数量"
+                                }
+                    
+                    break  # 成功则跳出循环
+                except Exception as model_error:
+                    last_error = model_error
+                    logger.warning(f"   ⚠️  模型 {model_name} 调用失败: {str(model_error)[:200]}")
+                    if model_name != models_to_try[-1]:
+                        logger.info(f"   尝试下一个模型...")
+                        continue
+                    else:
+                        # 所有模型都失败，抛出最后一个错误
+                        raise
+            
+            if response is None:
+                raise last_error if last_error else Exception("所有模型调用都失败")
+                
+        except Exception as api_error:
+            logger.exception(f"❌ [扫描] AI API 调用失败: {api_error}")
+            error_msg = str(api_error)
+            if "Connection" in error_msg or "timeout" in error_msg.lower():
+                return {
+                    "error": "AI API 连接超时或失败。可能原因：1) 网络连接问题 2) 请求内容过长 3) API 服务暂时不可用。请稍后重试，或减少分析的数据量。",
+                    "details": error_msg[:200],
+                    "records_count": len(recent_records),
+                    "content_length": len(analysis_prompt)
+                }
+            else:
+                return {
+                    "error": f"AI API 调用失败: {error_msg[:200]}"
+                }
+        
+        ai_response = response.choices[0].message.content.strip()
+        logger.info(f"✅ [扫描] AI 分析完成，响应长度: {len(ai_response)} 字符")
+        
+        # 解析 JSON 响应（带容错处理）
+        deep_dive_report = None
+        json_error = None
+        
+        # 方法1: 尝试直接解析
+        try:
+            deep_dive_report = json.loads(ai_response)
+            logger.debug("✅ [扫描] JSON 直接解析成功")
+        except json.JSONDecodeError as e:
+            json_error = e
+            logger.debug(f"⚠️  [扫描] 直接解析失败，尝试提取代码块: {e}")
+            
+            # 方法2: 尝试提取 ```json ... ``` 代码块中的内容
+            json_block_patterns = [
+                r'```json\s*\n(.*?)\n```',  # ```json ... ```
+                r'```\s*\n(.*?)\n```',       # ``` ... ```
+                r'```json\s*(.*?)```',      # ```json ... ``` (单行)
+                r'```\s*(.*?)```'           # ``` ... ``` (单行)
+            ]
+            
+            for pattern in json_block_patterns:
+                match = re.search(pattern, ai_response, re.DOTALL)
+                if match:
+                    extracted_json = match.group(1).strip()
+                    try:
+                        deep_dive_report = json.loads(extracted_json)
+                        logger.info(f"✅ [扫描] 从代码块中提取 JSON 成功")
+                        break
+                    except json.JSONDecodeError:
+                        continue
+        
+        # 如果仍然失败，返回错误信息
+        if deep_dive_report is None:
+            logger.error(f"❌ [扫描] JSON 解析失败: {json_error}")
+            return {
+                "error": "AI 返回的内容无法解析为有效的 JSON 格式",
+                "details": str(json_error) if json_error else "未知错误",
+                "raw_response_preview": ai_response[:500]
+            }
+        
+        # 验证返回结构
+        if "patterns" not in deep_dive_report or "summary" not in deep_dive_report:
+            logger.warning("⚠️  [扫描] AI 返回的结构不完整，尝试修复...")
+            if "patterns" not in deep_dive_report:
+                deep_dive_report["patterns"] = []
+            if "summary" not in deep_dive_report:
+                deep_dive_report["summary"] = "分析完成，但未生成总结。"
+        
+        # ========== 返回结果 ==========
+        result = {
+            "scan_period": f"{seven_days_ago} 至 {today}",
+            "records_analyzed": len(recent_records),
+            "deep_dive_report": deep_dive_report
+        }
+        
+        logger.info(f"✅ [扫描] 扫描完成，识别到 {len(deep_dive_report.get('patterns', []))} 个模式")
+        
+        return result
+        
+    except Exception as e:
+        logger.exception(f"❌ [扫描] 扫描过程出现异常: {e}")
+        return {
+            "error": f"扫描过程出现异常: {str(e)}"
+        }
+
+@app.get("/api/last-scan")
+async def get_last_scan():
+    """
+    获取最近一次自动扫描的结果
+    """
+    if not SCAN_RESULTS_FILE.exists():
+        return JSONResponse(
+            status_code=200,
+            content={
+                "message": "暂无自动扫描结果"
+            }
+        )
+    
+    try:
+        with open(SCAN_RESULTS_FILE, 'r', encoding='utf-8') as f:
+            scan_result = json.load(f)
+        return JSONResponse(status_code=200, content=scan_result)
+    except Exception as e:
+        logger.exception(f"❌ 读取扫描结果失败: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": f"读取扫描结果失败: {str(e)}"
+            }
+        )
+
+@app.post("/api/trigger-auto-scan")
+async def trigger_auto_scan():
+    """
+    手动触发自动扫描（立即执行一次并保存结果）
+    """
+    try:
+        logger.info("🔄 [手动触发] 用户手动触发自动扫描...")
+        auto_scan()  # 直接调用自动扫描函数
+        
+        # 读取刚保存的结果
+        if SCAN_RESULTS_FILE.exists():
+            with open(SCAN_RESULTS_FILE, 'r', encoding='utf-8') as f:
+                scan_result = json.load(f)
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "success": True,
+                    "message": "自动扫描已触发并完成",
+                    "scan_result": scan_result
+                }
+            )
+        else:
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "success": False,
+                    "error": "扫描完成但结果文件未生成"
+                }
+            )
+    except Exception as e:
+        logger.exception(f"❌ [手动触发] 触发自动扫描失败: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "error": f"触发自动扫描失败: {str(e)}"
+            }
+        )
+
+@app.post("/run-scan")
+async def run_scan():
+    """
+    个人状态监控扫描端点
+    
+    扫描最近 7 天的语音记录，进行深度分析，识别情绪模式、工作压力、项目进展等。
+    返回包含模式识别和建议的分析报告。
+    
+    注意：手动扫描的结果也会保存到 scan_results.json（与自动扫描一致）
+    """
+    result = _perform_scan()
+    
+    # 保存结果到文件（与自动扫描保持一致）
+    try:
+        scan_result = {
+            "scan_time": datetime.now().isoformat(),
+            "result": result,
+            "trigger": "manual"  # 标记为手动触发
+        }
+        with open(SCAN_RESULTS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(scan_result, f, ensure_ascii=False, indent=2)
+        logger.info("✅ [手动扫描] 结果已保存到 scan_results.json")
+    except Exception as e:
+        logger.warning(f"⚠️  [手动扫描] 保存结果失败: {e}")
+    
+    # 处理错误情况
+    if "error" in result:
+        status_code = 500 if "error" in result and result.get("scan_period") is None else 200
+        return JSONResponse(status_code=status_code, content=result)
+    
+    return JSONResponse(status_code=200, content=result)
+
 @app.get("/api/index-status")
 async def get_index_status_api():
     """获取索引重建状态"""
@@ -1562,345 +2018,609 @@ async def rebuild_index_api(background_tasks: BackgroundTasks):
             "error": str(e)
         }
 
-@app.get("/chat", response_class=HTMLResponse)
-async def chat_page():
-    """智能对话页面"""
-    html = """
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_page():
+    """管理页面：整合记录、扫描、设置"""
+    # 获取记录数据
+    records = load_records()
+    records.sort(key=lambda x: (x.get('date', ''), x.get('time', '')), reverse=True)
+    records_count = len(records)
+    
+    # 生成记录列表 HTML
+    records_html = ""
+    if records:
+        for r in records[:50]:  # 只显示最近50条
+            records_html += f'''
+            <div class="record-item">
+                <div class="record-meta">
+                    <span class="record-id">{r.get('id', '')}</span>
+                    <span class="record-time">{r.get('date', '')} {r.get('time', '')}</span>
+                </div>
+                <div class="record-content">{r.get('content', '').replace('<', '&lt;').replace('>', '&gt;')[:200]}{"..." if len(r.get('content', '')) > 200 else ""}</div>
+            </div>
+            '''
+    else:
+        records_html = '<div class="empty-state">暂无记录</div>'
+    
+    html = f"""
     <!DOCTYPE html>
     <html lang="zh-CN">
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>智能对话 - Voice Journal</title>
+        <title>管理 - Digital Memory</title>
         <style>
-            * { margin: 0; padding: 0; box-sizing: border-box; }
-            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
-            .app-container { display: flex; min-height: 100vh; }
-            .sidebar { width: 250px; background: #2c3e50; color: white; padding: 20px 0; }
-            .sidebar-header { padding: 0 20px 20px; border-bottom: 1px solid rgba(255,255,255,0.1); margin-bottom: 20px; }
-            .sidebar-header h1 { font-size: 20px; margin: 0; color: white; }
-            .sidebar-nav { list-style: none; padding: 0; margin: 0; }
-            .sidebar-nav li { margin: 0; }
-            .sidebar-nav a { display: block; padding: 15px 20px; color: rgba(255,255,255,0.8); text-decoration: none; transition: all 0.3s; border-left: 3px solid transparent; }
-            .sidebar-nav a:hover { background: rgba(255,255,255,0.1); color: white; }
-            .sidebar-nav a.active { background: rgba(102, 126, 234, 0.3); border-left-color: #667eea; color: white; }
-            .main-content { flex: 1; padding: 20px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
-            .container { max-width: 900px; margin: 0 auto; background: white; border-radius: 12px; box-shadow: 0 10px 40px rgba(0,0,0,0.1); height: calc(100vh - 40px); display: flex; flex-direction: column; }
-            .chat-header { padding: 20px; border-bottom: 1px solid #eee; }
-            .chat-area { flex: 1; overflow-y: auto; padding: 20px; background: #f5f5f5; }
-            .message { margin-bottom: 15px; }
-            .message.user { text-align: right; }
-            .message-content { display: inline-block; padding: 12px 18px; border-radius: 18px; max-width: 70%; }
-            .message.user .message-content { background: #667eea; color: white; }
-            .message.assistant .message-content { background: white; color: #333; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
-            .input-area { padding: 20px; border-top: 1px solid #eee; display: flex; gap: 10px; }
-            .input-area input { flex: 1; padding: 12px; border: 2px solid #ddd; border-radius: 25px; font-size: 14px; }
-            .input-area input:focus { outline: none; border-color: #667eea; }
-            .input-area button { padding: 12px 24px; background: #667eea; color: white; border: none; border-radius: 25px; cursor: pointer; transition: background 0.2s; }
-            .input-area button:hover { background: #5568d3; }
-            .input-area button:disabled { background: #ccc; cursor: not-allowed; }
-            .message.loading { opacity: 0.7; }
-            .message.error .message-content { background: #fee; color: #c33; border: 1px solid #fcc; }
+            * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+            
+            body {{
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                background: #343541;
+                color: #ececf1;
+                min-height: 100vh;
+            }}
+            
+            .header {{
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                padding: 15px 20px;
+                background: #202123;
+                border-bottom: 1px solid #565869;
+            }}
+            
+            .header h1 {{
+                font-size: 18px;
+                font-weight: 500;
+            }}
+            
+            .back-btn {{
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                padding: 8px 16px;
+                background: transparent;
+                border: 1px solid #565869;
+                border-radius: 6px;
+                color: #ececf1;
+                cursor: pointer;
+                font-size: 14px;
+                text-decoration: none;
+            }}
+            
+            .back-btn:hover {{
+                background: #2a2b32;
+            }}
+            
+            .tabs {{
+                display: flex;
+                background: #202123;
+                border-bottom: 1px solid #565869;
+            }}
+            
+            .tab {{
+                padding: 15px 30px;
+                background: transparent;
+                border: none;
+                color: #8e8ea0;
+                cursor: pointer;
+                font-size: 14px;
+                border-bottom: 2px solid transparent;
+                transition: all 0.2s;
+            }}
+            
+            .tab:hover {{
+                color: #ececf1;
+            }}
+            
+            .tab.active {{
+                color: #ececf1;
+                border-bottom-color: #19c37d;
+            }}
+            
+            .content {{
+                max-width: 900px;
+                margin: 0 auto;
+                padding: 20px;
+            }}
+            
+            .panel {{
+                display: none;
+            }}
+            
+            .panel.active {{
+                display: block;
+            }}
+            
+            /* 记录列表样式 */
+            .records-header {{
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 20px;
+            }}
+            
+            .records-count {{
+                color: #8e8ea0;
+                font-size: 14px;
+            }}
+            
+            .record-item {{
+                background: #40414f;
+                border-radius: 8px;
+                padding: 15px;
+                margin-bottom: 12px;
+            }}
+            
+            .record-meta {{
+                display: flex;
+                justify-content: space-between;
+                margin-bottom: 8px;
+                font-size: 12px;
+                color: #8e8ea0;
+            }}
+            
+            .record-content {{
+                line-height: 1.6;
+                font-size: 14px;
+            }}
+            
+            .empty-state {{
+                text-align: center;
+                color: #8e8ea0;
+                padding: 40px;
+            }}
+            
+            /* 扫描样式 */
+            .scan-section {{
+                background: #40414f;
+                border-radius: 8px;
+                padding: 20px;
+                margin-bottom: 20px;
+            }}
+            
+            .scan-section h3 {{
+                margin-bottom: 10px;
+                font-size: 16px;
+            }}
+            
+            .scan-section p {{
+                color: #8e8ea0;
+                font-size: 14px;
+                margin-bottom: 15px;
+            }}
+            
+            .btn {{
+                padding: 10px 20px;
+                background: #19c37d;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                cursor: pointer;
+                font-size: 14px;
+                transition: background 0.2s;
+            }}
+            
+            .btn:hover {{
+                background: #1a7f5a;
+            }}
+            
+            .btn:disabled {{
+                background: #565869;
+                cursor: not-allowed;
+            }}
+            
+            .btn-secondary {{
+                background: #565869;
+            }}
+            
+            .btn-secondary:hover {{
+                background: #6b6c7b;
+            }}
+            
+            /* 设置样式 */
+            .setting-item {{
+                background: #40414f;
+                border-radius: 8px;
+                padding: 20px;
+                margin-bottom: 15px;
+            }}
+            
+            .setting-item h3 {{
+                margin-bottom: 8px;
+                font-size: 16px;
+            }}
+            
+            .setting-item p {{
+                color: #8e8ea0;
+                font-size: 14px;
+                margin-bottom: 15px;
+            }}
+            
+            .progress-bar {{
+                width: 100%;
+                height: 8px;
+                background: #565869;
+                border-radius: 4px;
+                overflow: hidden;
+                margin: 15px 0;
+            }}
+            
+            .progress-fill {{
+                height: 100%;
+                background: #19c37d;
+                transition: width 0.3s;
+            }}
+            
+            .status-text {{
+                font-size: 13px;
+                color: #8e8ea0;
+            }}
+            
+            .status-text.success {{ color: #19c37d; }}
+            .status-text.error {{ color: #ef4444; }}
+            .status-text.running {{ color: #3b82f6; }}
+            
+            /* 扫描结果样式 */
+            .scan-results {{
+                margin-top: 20px;
+            }}
+            
+            .pattern-item {{
+                background: #2a2b32;
+                border-radius: 6px;
+                padding: 15px;
+                margin-bottom: 10px;
+                border-left: 3px solid #8e8ea0;
+            }}
+            
+            .pattern-item.high {{ border-left-color: #ef4444; }}
+            .pattern-item.medium {{ border-left-color: #f59e0b; }}
+            .pattern-item.low {{ border-left-color: #8e8ea0; }}
+            
+            .pattern-header {{
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                margin-bottom: 10px;
+            }}
+            
+            .pattern-importance {{
+                font-size: 11px;
+                padding: 2px 8px;
+                border-radius: 4px;
+                font-weight: 500;
+            }}
+            
+            .pattern-importance.high {{ background: rgba(239, 68, 68, 0.2); color: #ef4444; }}
+            .pattern-importance.medium {{ background: rgba(245, 158, 11, 0.2); color: #f59e0b; }}
+            .pattern-importance.low {{ background: rgba(142, 142, 160, 0.2); color: #8e8ea0; }}
+            
+            .pattern-title {{
+                font-weight: 500;
+            }}
+            
+            .pattern-content {{
+                font-size: 14px;
+                color: #8e8ea0;
+                line-height: 1.5;
+            }}
+            
+            .pattern-content p {{
+                margin-bottom: 5px;
+            }}
+            
+            .scan-summary {{
+                background: #2a2b32;
+                border-radius: 6px;
+                padding: 15px;
+                margin-top: 15px;
+            }}
+            
+            .scan-summary h4 {{
+                margin-bottom: 10px;
+                font-size: 14px;
+            }}
+            
+            .scan-summary p {{
+                font-size: 14px;
+                line-height: 1.6;
+            }}
         </style>
     </head>
     <body>
-        <div class="app-container">
-            <div class="sidebar">
-                <div class="sidebar-header">
-                    <h1>🎤 Voice Journal</h1>
-                    <p style="font-size: 12px; color: rgba(255,255,255,0.6); margin-top: 5px;">& Digital Twin</p>
+        <div class="header">
+            <h1>⚙️ 管理设置</h1>
+            <a href="/" class="back-btn">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M19 12H5M12 19l-7-7 7-7"/>
+                </svg>
+                返回对话
+            </a>
+        </div>
+        
+        <div class="tabs">
+            <button class="tab active" onclick="switchTab('records')">📝 记录</button>
+            <button class="tab" onclick="switchTab('scan')">🔍 状态扫描</button>
+            <button class="tab" onclick="switchTab('settings')">⚙️ 设置</button>
+        </div>
+        
+        <div class="content">
+            <!-- 记录面板 -->
+            <div id="records-panel" class="panel active">
+                <div class="records-header">
+                    <h2>所有记录</h2>
+                    <span class="records-count">共 {records_count} 条记录（显示最近 50 条）</span>
                 </div>
-                <ul class="sidebar-nav">
-                    <li><a href="/">🎤 录音</a></li>
-                    <li><a href="/records">📝 记录</a></li>
-                    <li><a href="/chat" class="active">🤖 智能对话</a></li>
-                    <li><a href="/settings">⚙️ 设置</a></li>
-                </ul>
+                <div id="records-list">
+                    {records_html}
+                </div>
             </div>
-            <div class="main-content">
-                <div class="container">
-                    <div class="chat-header">
-                        <h1>🤖 Digital Twin 守护者</h1>
-                        <p style="color: #666; font-size: 14px; margin-top: 5px;">你的个人记忆库智能助手</p>
+            
+            <!-- 扫描面板 -->
+            <div id="scan-panel" class="panel">
+                <div class="scan-section">
+                    <h3>个人状态扫描</h3>
+                    <p>扫描最近 7 天的记录，分析情绪模式、工作压力和生活状态。</p>
+                    <button class="btn" id="scanBtn" onclick="startScan()">开始扫描</button>
+                    <button class="btn btn-secondary" id="triggerAutoBtn" onclick="triggerAutoScan()" style="margin-left: 10px;">触发自动扫描</button>
+                </div>
+                
+                <div id="lastScanInfo" class="scan-section" style="display: none;">
+                    <h3>上次扫描结果</h3>
+                    <p id="lastScanTime"></p>
+                    <div id="lastScanPreview"></div>
+                </div>
+                
+                <div id="scanResults" class="scan-results"></div>
+            </div>
+            
+            <!-- 设置面板 -->
+            <div id="settings-panel" class="panel">
+                <div class="setting-item">
+                    <h3>索引重建</h3>
+                    <p>当记录同步出现问题时，可以手动重建 RAG 索引。</p>
+                    <button class="btn" id="rebuildBtn" onclick="rebuildIndex()">手动重建索引</button>
+                    <div class="progress-bar" id="progressBar" style="display: none;">
+                        <div class="progress-fill" id="progressFill" style="width: 0%;"></div>
                     </div>
-                    <div class="chat-area" id="chatArea">
-                        <div class="message assistant">
-                            <div class="message-content">
-                                你好！我是你的 Digital Twin 守护者。我可以帮你回忆过去、查找日记、分析模式。<br><br>
-                                试试问我："2024年6月2日我在做什么让我感到开心？"
-                            </div>
-                        </div>
-                    </div>
-                    <div class="input-area">
-                        <input type="text" id="messageInput" placeholder="输入你的问题..." autocomplete="off">
-                        <button onclick="sendMessage()">发送</button>
-                    </div>
+                    <p class="status-text" id="rebuildStatus"></p>
+                </div>
+                
+                <div class="setting-item">
+                    <h3>数据同步</h3>
+                    <p>录音记录会自动同步到 RAG 系统，新记录会实时更新索引。</p>
+                </div>
+                
+                <div class="setting-item">
+                    <h3>定时任务</h3>
+                    <p>• 索引重建检查：每 30 分钟<br>• 自动状态扫描：每小时</p>
                 </div>
             </div>
         </div>
+        
         <script>
-            const sessionId = 'chat_' + Date.now();
-            let isLoading = false;
+            // Tab 切换
+            function switchTab(tabName) {{
+                // 更新 tab 状态
+                document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
+                event.target.classList.add('active');
+                
+                // 更新面板显示
+                document.querySelectorAll('.panel').forEach(panel => panel.classList.remove('active'));
+                document.getElementById(tabName + '-panel').classList.add('active');
+                
+                // 切换到扫描时加载上次结果
+                if (tabName === 'scan') {{
+                    loadLastScan();
+                }}
+                
+                // 切换到设置时检查索引状态
+                if (tabName === 'settings') {{
+                    checkIndexStatus();
+                }}
+            }}
             
-            document.getElementById('messageInput').addEventListener('keypress', (e) => {
-                if (e.key === 'Enter' && !isLoading) sendMessage();
-            });
+            // ========== 扫描功能 ==========
+            async function loadLastScan() {{
+                try {{
+                    const response = await fetch('/api/last-scan');
+                    if (response.ok) {{
+                        const data = await response.json();
+                        if (data.scan_time) {{
+                            const lastScanInfo = document.getElementById('lastScanInfo');
+                            const lastScanTime = document.getElementById('lastScanTime');
+                            const lastScanPreview = document.getElementById('lastScanPreview');
+                            
+                            lastScanInfo.style.display = 'block';
+                            
+                            const scanDate = new Date(data.scan_time);
+                            lastScanTime.textContent = '扫描时间: ' + scanDate.toLocaleString('zh-CN');
+                            
+                            if (data.result.error) {{
+                                lastScanPreview.innerHTML = '<span style="color: #ef4444;">❌ ' + escapeHtml(data.result.error) + '</span>';
+                            }} else {{
+                                const patterns = data.result.deep_dive_report?.patterns || [];
+                                const highCount = patterns.filter(p => p.importance === 'High').length;
+                                const mediumCount = patterns.filter(p => p.importance === 'Medium').length;
+                                lastScanPreview.innerHTML = '识别到 ' + patterns.length + ' 个模式' +
+                                    (highCount > 0 ? ' (<span style="color:#ef4444;">High: ' + highCount + '</span>)' : '') +
+                                    (mediumCount > 0 ? ' (<span style="color:#f59e0b;">Medium: ' + mediumCount + '</span>)' : '');
+                            }}
+                        }}
+                    }}
+                }} catch (error) {{
+                    console.error('加载上次扫描失败:', error);
+                }}
+            }}
             
-            async function sendMessage() {
-                const input = document.getElementById('messageInput');
-                const message = input.value.trim();
-                if (!message || isLoading) return;
+            async function startScan() {{
+                const btn = document.getElementById('scanBtn');
+                const results = document.getElementById('scanResults');
                 
-                const chatArea = document.getElementById('chatArea');
-                const sendButton = document.querySelector('.input-area button');
+                btn.disabled = true;
+                btn.textContent = '扫描中...';
+                results.innerHTML = '<div class="empty-state">正在分析记录，请稍候...</div>';
                 
-                // 显示用户消息
-                chatArea.innerHTML += `<div class="message user"><div class="message-content">${escapeHtml(message)}</div></div>`;
-                input.value = '';
-                chatArea.scrollTop = chatArea.scrollHeight;
-                
-                // 显示加载消息
-                const loadingMsg = document.createElement('div');
-                loadingMsg.className = 'message assistant loading';
-                loadingMsg.innerHTML = '<div class="message-content">正在思考...</div>';
-                chatArea.appendChild(loadingMsg);
-                chatArea.scrollTop = chatArea.scrollHeight;
-                
-                // 禁用输入
-                isLoading = true;
-                input.disabled = true;
-                sendButton.disabled = true;
-                
-                try {
-                    const response = await fetch('/api/chat', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                        },
-                        body: JSON.stringify({
-                            message: message,
-                            session_id: sessionId
-                        })
-                    });
-                    
+                try {{
+                    const response = await fetch('/run-scan', {{ method: 'POST' }});
                     const data = await response.json();
                     
-                    // 更新消息
-                    loadingMsg.classList.remove('loading');
-                    if (data.success) {
-                        loadingMsg.innerHTML = `<div class="message-content">${escapeHtml(data.response).replace(/\\n/g, '<br>')}</div>`;
-                    } else {
-                        loadingMsg.className = 'message error';
-                        loadingMsg.innerHTML = `<div class="message-content">错误: ${escapeHtml(data.error || data.response)}</div>`;
-                    }
-                    
-                } catch (error) {
-                    loadingMsg.classList.remove('loading');
-                    loadingMsg.className = 'message error';
-                    loadingMsg.innerHTML = `<div class="message-content">网络错误: ${escapeHtml(error.message)}</div>`;
-                } finally {
-                    // 恢复输入
-                    isLoading = false;
-                    input.disabled = false;
-                    sendButton.disabled = false;
-                    input.focus();
-                    chatArea.scrollTop = chatArea.scrollHeight;
-                }
-            }
+                    if (data.error) {{
+                        results.innerHTML = '<div class="scan-section"><p style="color:#ef4444;">❌ ' + escapeHtml(data.error) + '</p></div>';
+                    }} else {{
+                        displayScanResults(data);
+                    }}
+                    loadLastScan();
+                }} catch (error) {{
+                    results.innerHTML = '<div class="scan-section"><p style="color:#ef4444;">❌ 网络错误: ' + escapeHtml(error.message) + '</p></div>';
+                }} finally {{
+                    btn.disabled = false;
+                    btn.textContent = '开始扫描';
+                }}
+            }}
             
-            function escapeHtml(text) {
-                const div = document.createElement('div');
-                div.textContent = text;
-                return div.innerHTML;
-            }
-        </script>
-    </body>
-    </html>
-    """
-    return html
-
-@app.get("/settings", response_class=HTMLResponse)
-async def settings_page():
-    """设置页面"""
-    html = """
-    <!DOCTYPE html>
-    <html lang="zh-CN">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>设置 - Voice Journal</title>
-        <style>
-            * { margin: 0; padding: 0; box-sizing: border-box; }
-            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
-            .app-container { display: flex; min-height: 100vh; }
-            .sidebar { width: 250px; background: #2c3e50; color: white; padding: 20px 0; }
-            .sidebar-header { padding: 0 20px 20px; border-bottom: 1px solid rgba(255,255,255,0.1); margin-bottom: 20px; }
-            .sidebar-header h1 { font-size: 20px; margin: 0; color: white; }
-            .sidebar-nav { list-style: none; padding: 0; margin: 0; }
-            .sidebar-nav li { margin: 0; }
-            .sidebar-nav a { display: block; padding: 15px 20px; color: rgba(255,255,255,0.8); text-decoration: none; transition: all 0.3s; border-left: 3px solid transparent; }
-            .sidebar-nav a:hover { background: rgba(255,255,255,0.1); color: white; }
-            .sidebar-nav a.active { background: rgba(102, 126, 234, 0.3); border-left-color: #667eea; color: white; }
-            .main-content { flex: 1; padding: 20px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
-            .container { max-width: 900px; margin: 0 auto; background: white; border-radius: 12px; box-shadow: 0 10px 40px rgba(0,0,0,0.1); padding: 30px; }
-            .setting-item { margin-bottom: 30px; padding-bottom: 20px; border-bottom: 1px solid #eee; }
-            .setting-item h3 { margin-bottom: 10px; color: #333; }
-            .setting-item p { color: #666; font-size: 14px; }
-            .progress-container { margin-top: 15px; }
-            .progress-bar { width: 100%; height: 24px; background: #f0f0f0; border-radius: 12px; overflow: hidden; margin-bottom: 8px; }
-            .progress-fill { height: 100%; background: linear-gradient(90deg, #667eea 0%, #764ba2 100%); transition: width 0.3s ease; display: flex; align-items: center; justify-content: center; color: white; font-size: 12px; font-weight: bold; }
-            .progress-message { font-size: 13px; color: #666; margin-top: 5px; }
-            .status-idle { color: #999; }
-            .status-running { color: #667eea; }
-            .status-completed { color: #28a745; }
-            .status-failed { color: #dc3545; }
-        </style>
-    </head>
-    <body>
-        <div class="app-container">
-            <div class="sidebar">
-                <div class="sidebar-header">
-                    <h1>🎤 Voice Journal</h1>
-                    <p style="font-size: 12px; color: rgba(255,255,255,0.6); margin-top: 5px;">& Digital Twin</p>
-                </div>
-                <ul class="sidebar-nav">
-                    <li><a href="/">🎤 录音</a></li>
-                    <li><a href="/records">📝 记录</a></li>
-                    <li><a href="/chat">🤖 智能对话</a></li>
-                    <li><a href="/settings" class="active">⚙️ 设置</a></li>
-                </ul>
-            </div>
-            <div class="main-content">
-                <div class="container">
-                    <h1>⚙️ 设置</h1>
-                    <div class="setting-item">
-                        <h3>索引重建</h3>
-                        <p>定时索引重建：每30分钟自动检查并重建索引（作为兜底）</p>
-                        <button id="rebuildBtn" onclick="rebuildIndex()" style="margin-top: 10px; padding: 10px 20px; background: #667eea; color: white; border: none; border-radius: 6px; cursor: pointer;">手动重建索引</button>
-                        <div class="progress-container" id="progressContainer" style="display: none;">
-                            <div class="progress-bar">
-                                <div class="progress-fill" id="progressFill" style="width: 0%;">0%</div>
-                            </div>
-                            <div class="progress-message" id="progressMessage"></div>
-                        </div>
-                        <p id="rebuildStatus" style="margin-top: 10px; font-size: 12px;"></p>
-                    </div>
-                    <div class="setting-item">
-                        <h3>数据同步</h3>
-                        <p>录音记录会自动同步到 RAG 系统</p>
-                    </div>
-                </div>
-            </div>
-        </div>
-        <script>
+            async function triggerAutoScan() {{
+                const btn = document.getElementById('triggerAutoBtn');
+                btn.disabled = true;
+                btn.textContent = '触发中...';
+                
+                try {{
+                    const response = await fetch('/api/trigger-auto-scan', {{ method: 'POST' }});
+                    const data = await response.json();
+                    
+                    if (data.success && data.scan_result) {{
+                        if (data.scan_result.result && !data.scan_result.result.error) {{
+                            displayScanResults(data.scan_result.result);
+                        }}
+                    }}
+                    loadLastScan();
+                }} catch (error) {{
+                    console.error('触发扫描失败:', error);
+                }} finally {{
+                    btn.disabled = false;
+                    btn.textContent = '触发自动扫描';
+                }}
+            }}
+            
+            function displayScanResults(data) {{
+                const results = document.getElementById('scanResults');
+                const patterns = data.deep_dive_report?.patterns || [];
+                const summary = data.deep_dive_report?.summary || '';
+                
+                let html = '<div class="scan-section"><p>扫描周期: ' + (data.scan_period || 'N/A') + ' | 分析记录: ' + (data.records_analyzed || 0) + ' 条</p></div>';
+                
+                if (patterns.length === 0) {{
+                    html += '<div class="empty-state">未发现明显的模式或问题。</div>';
+                }} else {{
+                    patterns.forEach(pattern => {{
+                        const importance = (pattern.importance || 'low').toLowerCase();
+                        html += '<div class="pattern-item ' + importance + '">' +
+                            '<div class="pattern-header">' +
+                            '<span class="pattern-importance ' + importance + '">' + (pattern.importance || 'Low') + '</span>' +
+                            '<span class="pattern-title">' + escapeHtml(pattern.pattern || '') + '</span>' +
+                            '</div>' +
+                            '<div class="pattern-content">' +
+                            '<p><strong>证据：</strong>' + escapeHtml(pattern.evidence || '无') + '</p>' +
+                            '<p><strong>建议：</strong>' + escapeHtml(pattern.suggestion || '无') + '</p>' +
+                            '</div></div>';
+                    }});
+                }}
+                
+                if (summary) {{
+                    html += '<div class="scan-summary"><h4>总结</h4><p>' + escapeHtml(summary) + '</p></div>';
+                }}
+                
+                results.innerHTML = html;
+            }}
+            
+            // ========== 索引重建功能 ==========
             let statusPollInterval = null;
             
-            // 页面加载时检查状态
-            window.addEventListener('load', () => {
-                checkIndexStatus();
-            });
-            
-            async function checkIndexStatus() {
-                try {
+            async function checkIndexStatus() {{
+                try {{
                     const response = await fetch('/api/index-status');
                     const data = await response.json();
+                    updateIndexStatusDisplay(data);
                     
-                    updateStatusDisplay(data);
-                    
-                    // 如果正在运行，继续轮询
-                    if (data.status === 'running') {
-                        if (!statusPollInterval) {
-                            statusPollInterval = setInterval(checkIndexStatus, 2000); // 每2秒检查一次
-                        }
-                    } else {
-                        // 停止轮询
-                        if (statusPollInterval) {
+                    if (data.status === 'running') {{
+                        if (!statusPollInterval) {{
+                            statusPollInterval = setInterval(checkIndexStatus, 2000);
+                        }}
+                    }} else {{
+                        if (statusPollInterval) {{
                             clearInterval(statusPollInterval);
                             statusPollInterval = null;
-                        }
-                    }
-                } catch (error) {
+                        }}
+                    }}
+                }} catch (error) {{
                     console.error('获取状态失败:', error);
-                }
-            }
+                }}
+            }}
             
-            function updateStatusDisplay(data) {
-                const statusEl = document.getElementById('rebuildStatus');
-                const progressContainer = document.getElementById('progressContainer');
-                const progressFill = document.getElementById('progressFill');
-                const progressMessage = document.getElementById('progressMessage');
+            function updateIndexStatusDisplay(data) {{
                 const btn = document.getElementById('rebuildBtn');
+                const progressBar = document.getElementById('progressBar');
+                const progressFill = document.getElementById('progressFill');
+                const status = document.getElementById('rebuildStatus');
                 
-                // 更新状态文本
-                statusEl.textContent = data.message || '未开始';
+                status.textContent = data.message || '';
+                status.className = 'status-text';
                 
-                // 根据状态更新样式和显示
-                if (data.status === 'idle') {
-                    statusEl.className = 'status-idle';
-                    progressContainer.style.display = 'none';
-                    btn.disabled = false;
-                } else if (data.status === 'running') {
-                    statusEl.className = 'status-running';
-                    progressContainer.style.display = 'block';
+                if (data.status === 'running') {{
+                    progressBar.style.display = 'block';
                     progressFill.style.width = data.progress + '%';
-                    progressFill.textContent = data.progress + '%';
-                    progressMessage.textContent = data.message || '正在处理...';
+                    status.classList.add('running');
                     btn.disabled = true;
-                } else if (data.status === 'completed') {
-                    statusEl.className = 'status-completed';
-                    statusEl.textContent = '✓ ' + (data.message || '索引重建完成！');
-                    progressContainer.style.display = 'block';
+                }} else if (data.status === 'completed') {{
+                    progressBar.style.display = 'block';
                     progressFill.style.width = '100%';
-                    progressFill.textContent = '100%';
-                    progressMessage.textContent = '✓ ' + (data.message || '索引重建完成！');
+                    status.classList.add('success');
                     btn.disabled = false;
-                    // 3秒后隐藏进度条
-                    setTimeout(() => {
-                        progressContainer.style.display = 'none';
-                    }, 3000);
-                } else if (data.status === 'failed') {
-                    statusEl.className = 'status-failed';
-                    statusEl.textContent = '✗ ' + (data.message || '索引重建失败');
-                    progressContainer.style.display = 'block';
-                    progressFill.style.width = '100%';
-                    progressFill.style.background = '#dc3545';
-                    progressFill.textContent = '失败';
-                    progressMessage.textContent = '✗ ' + (data.message || '索引重建失败');
+                    setTimeout(() => {{ progressBar.style.display = 'none'; }}, 3000);
+                }} else if (data.status === 'failed') {{
+                    progressBar.style.display = 'none';
+                    status.classList.add('error');
                     btn.disabled = false;
-                }
-            }
+                }} else {{
+                    progressBar.style.display = 'none';
+                    btn.disabled = false;
+                }}
+            }}
             
-            async function rebuildIndex() {
+            async function rebuildIndex() {{
                 const btn = document.getElementById('rebuildBtn');
                 const status = document.getElementById('rebuildStatus');
                 
                 btn.disabled = true;
-                status.textContent = '正在启动重建任务...';
-                status.className = 'status-running';
+                status.textContent = '正在启动...';
+                status.className = 'status-text running';
                 
-                try {
-                    const response = await fetch('/api/rebuild-index', {
-                        method: 'POST'
-                    });
+                try {{
+                    const response = await fetch('/api/rebuild-index', {{ method: 'POST' }});
                     const data = await response.json();
                     
-                    if (data.success) {
-                        // 开始轮询状态
+                    if (data.success) {{
                         checkIndexStatus();
-                        if (!statusPollInterval) {
+                        if (!statusPollInterval) {{
                             statusPollInterval = setInterval(checkIndexStatus, 2000);
-                        }
-                    } else {
-                        status.textContent = '✗ 错误: ' + (data.error || '未知错误');
-                        status.className = 'status-failed';
+                        }}
+                    }} else {{
+                        status.textContent = '❌ ' + (data.error || '启动失败');
+                        status.className = 'status-text error';
                         btn.disabled = false;
-                    }
-                } catch (error) {
-                    status.textContent = '✗ 网络错误: ' + error.message;
-                    status.className = 'status-failed';
+                    }}
+                }} catch (error) {{
+                    status.textContent = '❌ 网络错误';
+                    status.className = 'status-text error';
                     btn.disabled = false;
-                }
-            }
+                }}
+            }}
+            
+            function escapeHtml(text) {{
+                const div = document.createElement('div');
+                div.textContent = text;
+                return div.innerHTML;
+            }}
         </script>
     </body>
     </html>
