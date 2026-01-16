@@ -127,7 +127,7 @@ python process_voice.py "今天和朋友吃饭，聊到他准备换工作"
 
 ### 智能对话
 
-访问 http://localhost:8000/chat，可以问：
+访问 http://localhost:8000/chat
 
 - "最近两天有什么记录？"
 - "2024年6月2日我在做什么让我感到开心？"
