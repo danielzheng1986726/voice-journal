@@ -12,6 +12,10 @@ voice_records.json
 conversations.json
 *.index
 .indexed_ids.json
+firebase-credentials.json
+firebase-service-account.json
+*.bak
+scan_results.json
 
 # 日志
 *.log

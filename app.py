@@ -11,14 +11,18 @@ import logging
 import subprocess
 import re
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Header, status
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from datetime import datetime, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from dotenv import load_dotenv
 from openai import OpenAI
+from typing import Optional
+import firebase_admin
+from firebase_admin import credentials, auth as firebase_auth
 
 # 加载环境变量
 load_dotenv()
@@ -70,6 +74,83 @@ except Exception as e:
     logger.info("   录音功能正常工作，RAG 聊天功能将返回友好提示")
     RAG_AVAILABLE = False
     chat_with_agent = None
+
+# ================= Firebase 初始化 =================
+# 使用默认凭证（适用于本地开发和云端部署）
+FIREBASE_AVAILABLE = False
+try:
+    # 检查是否已经初始化
+    firebase_admin.get_app()
+    logger.info("✅ Firebase Admin SDK 已初始化")
+    FIREBASE_AVAILABLE = True
+except ValueError:
+    # 未初始化，尝试初始化
+    # 本地开发：需要服务账号 JSON 文件
+    # 如果没有，则跳过初始化（API 验证会被禁用）
+    service_account_path = os.getenv("FIREBASE_SERVICE_ACCOUNT", "firebase-service-account.json")
+    # 也检查旧的凭证文件名（向后兼容）
+    old_credentials_path = Path(__file__).parent / "firebase-credentials.json"
+    
+    credentials_path = None
+    if os.path.exists(service_account_path):
+        credentials_path = service_account_path
+    elif old_credentials_path.exists():
+        credentials_path = str(old_credentials_path)
+    
+    if credentials_path:
+        try:
+            cred = credentials.Certificate(credentials_path)
+            firebase_admin.initialize_app(cred)
+            logger.info("✅ Firebase Admin SDK 初始化成功")
+            FIREBASE_AVAILABLE = True
+        except Exception as e:
+            logger.warning(f"⚠️  Firebase 初始化失败: {e}")
+            FIREBASE_AVAILABLE = False
+    else:
+        logger.warning("⚠️  未找到 Firebase 服务账号文件，API 验证已禁用（开发模式）")
+        FIREBASE_AVAILABLE = False
+
+# ================= Token 验证 =================
+security = HTTPBearer(auto_error=False)
+
+async def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> dict:
+    """
+    验证 Firebase ID Token，返回用户信息。
+    如果 Firebase 未初始化或 token 无效，返回开发用户（开发模式）或抛出 401。
+    """
+    # 检查 Firebase 是否初始化
+    try:
+        firebase_admin.get_app()
+        firebase_initialized = True
+    except ValueError:
+        firebase_initialized = False
+    
+    if not firebase_initialized:
+        # Firebase 未初始化，开发模式跳过验证
+        logger.debug("⚠️  Firebase 未初始化，使用开发模式用户")
+        return {"uid": "dev-user", "email": "dev@localhost"}
+    
+    if not credentials:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="未提供认证信息",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    token = credentials.credentials
+    try:
+        decoded_token = firebase_auth.verify_id_token(token)
+        return {
+            "uid": decoded_token["uid"],
+            "email": decoded_token.get("email", "")
+        }
+    except Exception as e:
+        logger.warning(f"⚠️  Token 验证失败: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Token 验证失败: {str(e)}",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
 # 初始化定时任务调度器
 scheduler = BackgroundScheduler()
@@ -220,7 +301,7 @@ def generate_id():
     now = datetime.now()
     return f"voice_{now.strftime('%Y%m%d_%H%M')}"
 
-def create_record(content: str, conversation_id: str | None = None):
+def create_record(content: str, conversation_id: str | None = None, user_id: str | None = None):
     """创建一条记录"""
     now = datetime.now()
     record = {
@@ -233,6 +314,9 @@ def create_record(content: str, conversation_id: str | None = None):
     # 仅当提供会话 ID 时才写入字段，兼容旧数据
     if conversation_id:
         record["conversation_id"] = conversation_id
+    # 写入用户 ID（数据隔离）
+    if user_id:
+        record["user_id"] = user_id
     return record
 
 def load_records():
@@ -284,16 +368,16 @@ async def index():
         }
         
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            font-family: 'Söhne', 'ui-sans-serif', 'system-ui', '-apple-system', 'Segoe UI', 'Roboto', 'Ubuntu', 'Cantarell', 'Noto Sans', sans-serif;
             height: 100vh;
             display: flex;
-            background: #343541;
+            background: #212121;
             color: #ececf1;
         }
         
         .sidebar {
             width: 260px;
-            background: #202123;
+            background: #171717;
             display: flex;
             flex-direction: column;
             padding: 10px;
@@ -348,44 +432,65 @@ async def index():
             flex: 1;
             overflow-y: auto;
             padding: 20px;
+            background: #212121;
         }
         
         .message {
-            max-width: 800px;
+            max-width: 768px;
             margin: 0 auto 20px;
             padding: 20px;
             line-height: 1.6;
+            display: flex;
+            gap: 16px;
         }
         
         .message.user {
-            background: #343541;
+            background: transparent;
         }
         
         .message.assistant {
-            background: #444654;
-            border-radius: 5px;
+            background: transparent;
         }
         
         .message-role {
-            font-weight: bold;
-            margin-bottom: 10px;
-            font-size: 14px;
+            display: none;
+        }
+        
+        .avatar {
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            flex-shrink: 0;
+        }
+        
+        .ai-avatar {
+            background: #10a37f;
+        }
+        
+        .user-avatar {
+            background: #5c5c5c;
+        }
+        
+        .message-content {
+            flex: 1;
         }
         
         .input-area {
             padding: 20px;
-            background: #343541;
+            background: #212121;
         }
         
         .input-container {
-            max-width: 800px;
+            max-width: 768px;
             margin: 0 auto;
             display: flex;
-            align-items: flex-end;
-            gap: 10px;
-            background: #40414f;
-            border-radius: 10px;
-            padding: 10px 15px;
+            align-items: center;
+            gap: 8px;
+            background: #2f2f2f;
+            border: 1px solid #424242;
+            border-radius: 24px;
+            padding: 12px 16px 12px 52px;
+            position: relative;
         }
         
         .input-box {
@@ -397,6 +502,7 @@ async def index():
             resize: none;
             max-height: 200px;
             outline: none;
+            padding: 0;
         }
         
         .input-box::placeholder {
@@ -404,20 +510,22 @@ async def index():
         }
         
         .voice-btn, .send-btn {
-            width: 40px;
-            height: 40px;
+            width: 32px;
+            height: 32px;
             border: none;
-            border-radius: 5px;
+            border-radius: 50%;
             cursor: pointer;
             display: flex;
             align-items: center;
             justify-content: center;
-            font-size: 18px;
+            background: transparent;
+            color: #9b9b9b;
+            padding: 0;
         }
         
         .voice-btn {
-            background: transparent;
-            color: #8e8ea0;
+            position: absolute;
+            left: 12px;
         }
         
         .voice-btn:hover {
@@ -436,17 +544,17 @@ async def index():
         }
         
         .send-btn {
-            background: #19c37d;
+            background: #10a37f;
             color: white;
         }
         
         .send-btn:hover {
-            background: #1a7f5a;
+            background: #0d8c6f;
         }
         
         .send-btn:disabled {
-            background: #40414f;
-            color: #8e8ea0;
+            background: transparent;
+            color: #9b9b9b;
             cursor: not-allowed;
         }
         
@@ -553,8 +661,122 @@ async def index():
         }
 
         .chat-history-item.active {
-            background: #343541;
-            border-left: 3px solid #19c37d;
+            background: #2a2b32;
+            border-left: 3px solid #10a37f;
+        }
+        
+        .user-info {
+            padding: 10px;
+            border-top: 1px solid #424242;
+            margin-top: 10px;
+            font-size: 12px;
+            color: #9b9b9b;
+        }
+        
+        .user-email {
+            margin-bottom: 8px;
+        }
+        
+        .logout-btn {
+            width: 100%;
+            padding: 8px;
+            background: transparent;
+            border: 1px solid #424242;
+            border-radius: 6px;
+            color: #ececf1;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        
+        .logout-btn:hover {
+            background: #2a2b32;
+        }
+        
+        /* 登录界面样式 */
+        .login-modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.8);
+            z-index: 1000;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        .login-modal.show {
+            display: flex;
+        }
+        
+        .login-card {
+            background: #171717;
+            border-radius: 12px;
+            padding: 40px;
+            width: 400px;
+            max-width: 90vw;
+        }
+        
+        .login-title {
+            font-size: 24px;
+            font-weight: 600;
+            margin-bottom: 24px;
+            text-align: center;
+        }
+        
+        .login-form input {
+            width: 100%;
+            padding: 12px;
+            margin-bottom: 16px;
+            background: #2f2f2f;
+            border: 1px solid #424242;
+            border-radius: 8px;
+            color: #ececf1;
+            font-size: 14px;
+            outline: none;
+        }
+        
+        .login-form input:focus {
+            border-color: #10a37f;
+        }
+        
+        .login-btn {
+            width: 100%;
+            padding: 12px;
+            background: #10a37f;
+            border: none;
+            border-radius: 8px;
+            color: white;
+            font-size: 16px;
+            cursor: pointer;
+            margin-bottom: 12px;
+        }
+        
+        .login-btn:hover {
+            background: #0d8c6f;
+        }
+        
+        .login-switch {
+            text-align: center;
+            color: #9b9b9b;
+            font-size: 14px;
+            cursor: pointer;
+        }
+        
+        .login-switch:hover {
+            color: #ececf1;
+        }
+        
+        .login-error {
+            color: #ef4444;
+            font-size: 12px;
+            margin-bottom: 12px;
+            display: none;
+        }
+        
+        .login-error.show {
+            display: block;
         }
 
         .conv-title {
@@ -583,61 +805,209 @@ async def index():
     </style>
 </head>
 <body>
-    <button class="menu-btn" onclick="toggleSidebar()">☰</button>
-    <button class="settings-btn" onclick="window.location.href='/admin'" title="管理设置">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-            <circle cx="12" cy="12" r="3"/>
-            <path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/>
-        </svg>
-    </button>
-    
-    <aside class="sidebar" id="sidebar">
-        <button class="new-chat-btn" onclick="newChat()">
-            <span>+</span> 新对话
-        </button>
-        <div class="chat-history" id="chatHistory">
+    <!-- 登录界面 -->
+    <div class="login-modal" id="loginModal">
+        <div class="login-card">
+            <h1 class="login-title">登录 Digital Memory</h1>
+            <div class="login-error" id="loginError"></div>
+            <form class="login-form" id="loginForm" onsubmit="handleLogin(event)">
+                <input type="email" id="loginEmail" placeholder="邮箱" required>
+                <input type="password" id="loginPassword" placeholder="密码" required>
+                <input type="password" id="loginConfirmPassword" placeholder="确认密码" style="display: none;">
+                <button type="submit" class="login-btn" id="loginBtn">登录</button>
+                <div class="login-switch" id="loginSwitch" onclick="toggleLoginMode()">没有账号？注册</div>
+            </form>
         </div>
-    </aside>
+    </div>
     
-    <main class="main-content">
-        <div class="chat-messages" id="chatMessages">
-            <div class="message assistant">
-                <div class="message-role">🤖 Digital Twin</div>
-                <div class="message-content">
-                    你好！我是你的数字记忆助手。你可以用文字或语音和我对话，我会记住我们的交流。<br><br>
-                    试试问我：「最近两天我说了什么」或「帮我回忆上个月的事」
+    <!-- 主应用（登录后显示） -->
+    <div id="mainApp" style="display: none; width: 100%; height: 100vh;">
+        <button class="menu-btn" onclick="toggleSidebar()">☰</button>
+        <button class="settings-btn" onclick="window.location.href='/admin'" title="管理设置">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="3"/>
+                <path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/>
+            </svg>
+        </button>
+        
+        <aside class="sidebar" id="sidebar">
+            <button class="new-chat-btn" onclick="newChat()">
+                <span>+</span> 新对话
+            </button>
+            <div class="chat-history" id="chatHistory">
+            </div>
+            <div class="user-info" id="userInfo" style="display: none;">
+                <div class="user-email" id="userEmail"></div>
+                <button class="logout-btn" onclick="handleLogout()">登出</button>
+            </div>
+        </aside>
+        
+        <main class="main-content">
+            <div class="chat-messages" id="chatMessages">
+                <div class="message assistant">
+                    <div class="avatar ai-avatar"></div>
+                    <div class="message-content">
+                        你好！我是你的数字记忆助手。你可以用文字或语音和我对话，我会记住我们的交流。<br><br>
+                        试试问我：「最近两天我说了什么」或「帮我回忆上个月的事」
+                    </div>
                 </div>
             </div>
-        </div>
-        
-        <div class="input-area">
-            <div class="input-container">
-                <textarea 
-                    class="input-box" 
-                    id="inputBox" 
-                    placeholder="输入消息，或点击麦克风语音输入..."
-                    rows="1"
-                    onkeydown="handleKeyDown(event)"
-                    oninput="autoResize(this)"
-                ></textarea>
-                <button class="voice-btn" id="voiceBtn" onclick="toggleVoice()">
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                        <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/>
-                        <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
-                        <line x1="12" y1="19" x2="12" y2="22"/>
-                    </svg>
-                </button>
-                <button class="send-btn" id="sendBtn" onclick="sendMessage()">➤</button>
+            
+            <div class="input-area">
+                <div class="input-container">
+                    <button class="voice-btn" id="voiceBtn" onclick="toggleVoice()">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/>
+                            <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+                            <line x1="12" y1="19" x2="12" y2="22"/>
+                        </svg>
+                    </button>
+                    <textarea 
+                        class="input-box" 
+                        id="inputBox" 
+                        placeholder="输入消息..."
+                        rows="1"
+                        onkeydown="handleKeyDown(event)"
+                        oninput="autoResize(this)"
+                    ></textarea>
+                    <button class="send-btn" id="sendBtn" onclick="sendMessage()">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+                            <path d="M12 4L12 20M12 4L6 10M12 4L18 10" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                        </svg>
+                    </button>
+                </div>
             </div>
-        </div>
-    </main>
+        </main>
+    </div>
 
-    <script>
+    <script type="module">
+// Firebase 配置
+const firebaseConfig = {
+  apiKey: "AIzaSyDuWwWz2vWm6FV50w5ozL0DFoxfJfcEy0g",
+  authDomain: "voice-journal-auth-ba3b0.firebaseapp.com",
+  projectId: "voice-journal-auth-ba3b0"
+};
+
+// 导入 Firebase JS SDK
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
+import { getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword, onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-auth.js";
+
+// 初始化 Firebase
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+
+// 全局变量
+let authToken = null;
+let isLoginMode = true;  // true: 登录模式, false: 注册模式
+
 // 状态管理
 let isRecording = false;
 let recognition = null;
 let finalTranscript = '';
 let currentConversationId = null;
+
+// Firebase 认证状态监听
+onAuthStateChanged(auth, (user) => {
+    if (user) {
+        // 已登录
+        document.getElementById('loginModal').classList.remove('show');
+        document.getElementById('mainApp').style.display = 'flex';
+        // 获取并存储 ID Token
+        user.getIdToken().then(token => {
+            authToken = token;
+            // 显示用户信息
+            const userEmail = document.getElementById('userEmail');
+            const userInfo = document.getElementById('userInfo');
+            if (userEmail && userInfo) {
+                userEmail.textContent = user.email || 'unknown@local';
+                userInfo.style.display = 'block';
+            }
+            // 每小时刷新 Token
+            setInterval(() => {
+                user.getIdToken(true).then(token => {
+                    authToken = token;
+                });
+            }, 55 * 60 * 1000); // 55分钟刷新一次（Firebase token 有效期 1 小时）
+        });
+    } else {
+        // 未登录
+        document.getElementById('loginModal').classList.add('show');
+        document.getElementById('mainApp').style.display = 'none';
+        authToken = null;
+    }
+});
+
+// 登录/注册处理
+async function handleLogin(event) {
+    event.preventDefault();
+    const email = document.getElementById('loginEmail').value;
+    const password = document.getElementById('loginPassword').value;
+    const confirmPassword = document.getElementById('loginConfirmPassword');
+    const errorDiv = document.getElementById('loginError');
+    const loginBtn = document.getElementById('loginBtn');
+    
+    errorDiv.classList.remove('show');
+    
+    // 注册模式需要确认密码
+    if (!isLoginMode && confirmPassword.style.display !== 'none') {
+        if (password !== confirmPassword.value) {
+            errorDiv.textContent = '密码不一致';
+            errorDiv.classList.add('show');
+            return;
+        }
+    }
+    
+    try {
+        loginBtn.disabled = true;
+        loginBtn.textContent = isLoginMode ? '登录中...' : '注册中...';
+        
+        if (isLoginMode) {
+            await signInWithEmailAndPassword(auth, email, password);
+        } else {
+            await createUserWithEmailAndPassword(auth, email, password);
+        }
+    } catch (error) {
+        errorDiv.textContent = isLoginMode ? '登录失败: ' + error.message : '注册失败: ' + error.message;
+        errorDiv.classList.add('show');
+        loginBtn.disabled = false;
+        loginBtn.textContent = isLoginMode ? '登录' : '注册';
+    }
+}
+
+// 切换登录/注册模式
+function toggleLoginMode() {
+    isLoginMode = !isLoginMode;
+    const loginBtn = document.getElementById('loginBtn');
+    const loginSwitch = document.getElementById('loginSwitch');
+    const confirmPassword = document.getElementById('loginConfirmPassword');
+    const errorDiv = document.getElementById('loginError');
+    
+    errorDiv.classList.remove('show');
+    
+    if (isLoginMode) {
+        loginBtn.textContent = '登录';
+        loginSwitch.textContent = '没有账号？注册';
+        confirmPassword.style.display = 'none';
+    } else {
+        loginBtn.textContent = '注册';
+        loginSwitch.textContent = '已有账号？登录';
+        confirmPassword.style.display = 'block';
+    }
+}
+
+// 登出
+async function handleLogout() {
+    try {
+        await signOut(auth);
+    } catch (error) {
+        console.error('登出失败:', error);
+    }
+}
+
+// 导出登录相关函数到全局（供 HTML onclick 调用）
+window.handleLogin = handleLogin;
+window.toggleLoginMode = toggleLoginMode;
+window.handleLogout = handleLogout;
 
 // 初始化语音识别
 function initSpeechRecognition() {
@@ -678,13 +1048,13 @@ function initSpeechRecognition() {
     }
 }
 
-function toggleVoice() {
+window.toggleVoice = function toggleVoice() {
     if (isRecording) {
         stopRecording();
     } else {
         startRecording();
     }
-}
+};
 
 function startRecording() {
     if (!recognition) {
@@ -707,7 +1077,7 @@ function stopRecording() {
 }
 
 // 发送消息
-async function sendMessage() {
+window.sendMessage = async function sendMessage() {
     const inputBox = document.getElementById('inputBox');
     const message = inputBox.value.trim();
     
@@ -727,10 +1097,18 @@ async function sendMessage() {
     showTypingIndicator();
     
     try {
+        const headers = { 'Content-Type': 'application/json' };
+        if (authToken) {
+            headers['Authorization'] = 'Bearer ' + authToken;
+        }
+        
         const response = await fetch('/api/chat', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ message: message })
+            headers: headers,
+            body: JSON.stringify({ 
+                message: message,
+                session_id: currentConversationId 
+            })
         });
         
         const data = await response.json();
@@ -754,8 +1132,14 @@ function addMessage(role, content) {
     const messagesDiv = document.getElementById('chatMessages');
     const messageDiv = document.createElement('div');
     messageDiv.className = 'message ' + role;
+    
+    const avatarClass = role === 'user' ? 'user-avatar' : 'ai-avatar';
+    const avatarSvg = role === 'user' 
+        ? '<svg width="24" height="24" viewBox="0 0 24 24" fill="none"><rect width="24" height="24" rx="12" fill="#5c5c5c"/><path d="M12 12C13.66 12 15 10.66 15 9C15 7.34 13.66 6 12 6C10.34 6 9 7.34 9 9C9 10.66 10.34 12 12 12ZM12 14C9.33 14 4 15.34 4 18V19H20V18C20 15.34 14.67 14 12 14Z" fill="white"/></svg>'
+        : '<svg width="24" height="24" viewBox="0 0 24 24" fill="none"><rect width="24" height="24" rx="12" fill="#10a37f"/><path d="M12 4L14 8L18 9L15 12L16 16L12 14L8 16L9 12L6 9L10 8L12 4Z" fill="white"/></svg>';
+    
     messageDiv.innerHTML = 
-        '<div class="message-role">' + (role === 'user' ? '👤 你' : '🤖 AI 助手') + '</div>' +
+        '<div class="avatar ' + avatarClass + '">' + avatarSvg + '</div>' +
         '<div class="message-content">' + formatContent(content) + '</div>';
     messagesDiv.appendChild(messageDiv);
     messagesDiv.scrollTop = messagesDiv.scrollHeight;
@@ -774,7 +1158,7 @@ function showTypingIndicator() {
     indicator.id = 'typingIndicator';
     indicator.className = 'message assistant';
     indicator.innerHTML = 
-        '<div class="message-role">🤖 AI 助手</div>' +
+        '<div class="avatar ai-avatar"></div>' +
         '<div class="typing-indicator"><span></span><span></span><span></span></div>';
     messagesDiv.appendChild(indicator);
     messagesDiv.scrollTop = messagesDiv.scrollHeight;
@@ -788,9 +1172,14 @@ function hideTypingIndicator() {
 // 保存到记忆，关联会话ID
 async function saveToMemory(userMessage, aiResponse) {
     try {
+        const headers = { 'Content-Type': 'application/json' };
+        if (authToken) {
+            headers['Authorization'] = 'Bearer ' + authToken;
+        }
+        
         await fetch('/api/voice', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: headers,
             body: JSON.stringify({
                 content: '[对话] 我说：' + userMessage,
                 conversation_id: currentConversationId
@@ -799,7 +1188,7 @@ async function saveToMemory(userMessage, aiResponse) {
         
         await fetch('/api/voice', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: headers,
             body: JSON.stringify({
                 content: '[对话] AI 回复：' + aiResponse,
                 conversation_id: currentConversationId
@@ -813,9 +1202,14 @@ async function saveToMemory(userMessage, aiResponse) {
 // 创建新会话
 async function createNewConversation() {
     try {
+        const headers = { 'Content-Type': 'application/json' };
+        if (authToken) {
+            headers['Authorization'] = 'Bearer ' + authToken;
+        }
+        
         const response = await fetch('/api/conversations', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' }
+            headers: headers
         });
         const conv = await response.json();
         currentConversationId = conv.id;
@@ -827,12 +1221,12 @@ async function createNewConversation() {
 }
 
 // 新对话按钮
-async function newChat() {
+window.newChat = async function newChat() {
     currentConversationId = null;
     
     document.getElementById('chatMessages').innerHTML = 
         '<div class="message assistant">' +
-        '<div class="message-role">🤖 AI 助手</div>' +
+        '<div class="avatar ai-avatar"></div>' +
         '<div class="message-content">' +
         '你好！我是你的数字记忆助手。你可以和我聊天，我会记住我们的对话。' +
         '</div></div>';
@@ -845,7 +1239,12 @@ async function newChat() {
 // 加载会话列表
 async function loadConversations() {
     try {
-        const response = await fetch('/api/conversations');
+        const headers = {};
+        if (authToken) {
+            headers['Authorization'] = 'Bearer ' + authToken;
+        }
+        
+        const response = await fetch('/api/conversations', { headers: headers });
         const data = await response.json();
         const conversations = data.conversations || [];
         
@@ -898,8 +1297,14 @@ async function deleteConversation(convId) {
     }
     
     try {
+        const headers = {};
+        if (authToken) {
+            headers['Authorization'] = 'Bearer ' + authToken;
+        }
+        
         await fetch('/api/conversations/' + convId, {
-            method: 'DELETE'
+            method: 'DELETE',
+            headers: headers
         });
         
         // 如果删除的是当前会话，重置为新对话界面
@@ -927,7 +1332,12 @@ async function loadConversation(convId, clickedItem) {
         }
         
         // 获取会话消息
-        const response = await fetch('/api/conversations/' + convId + '/messages');
+        const headers = {};
+        if (authToken) {
+            headers['Authorization'] = 'Bearer ' + authToken;
+        }
+        
+        const response = await fetch('/api/conversations/' + convId + '/messages', { headers: headers });
         const data = await response.json();
         const messages = data.messages || [];
         
@@ -938,7 +1348,7 @@ async function loadConversation(convId, clickedItem) {
         if (messages.length === 0) {
             messagesDiv.innerHTML = 
                 '<div class="message assistant">' +
-                '<div class="message-role">🤖 AI 助手</div>' +
+                '<div class="avatar ai-avatar"></div>' +
                 '<div class="message-content">这个会话还没有消息。</div></div>';
             return;
         }
@@ -961,21 +1371,22 @@ async function loadConversation(convId, clickedItem) {
     }
 }
 
-function toggleSidebar() {
+// 导出到全局作用域（供 HTML onclick/onkeydown 调用）
+window.toggleSidebar = function() {
     document.getElementById('sidebar').classList.toggle('open');
-}
+};
 
-function autoResize(textarea) {
+window.autoResize = function(textarea) {
     textarea.style.height = 'auto';
     textarea.style.height = Math.min(textarea.scrollHeight, 200) + 'px';
-}
+};
 
-function handleKeyDown(event) {
+window.handleKeyDown = function(event) {
     if (event.key === 'Enter' && !event.shiftKey) {
         event.preventDefault();
         sendMessage();
     }
-}
+};
 
 // 页面加载完成
 document.addEventListener('DOMContentLoaded', () => {
@@ -988,24 +1399,34 @@ document.addEventListener('DOMContentLoaded', () => {
     return html
 
 @app.get("/api/records")
-async def get_records():
-    """API 端点：获取所有记录"""
+async def get_records(current_user: dict = Depends(get_current_user)):
+    """获取当前用户的记录列表"""
+    user_id = current_user.get("uid", "")
+    logger.info(f"🔐 用户 {current_user.get('email', 'unknown')} 请求获取记录列表")
     records = load_records()
-    records.sort(key=lambda x: (x.get('date', ''), x.get('time', '')), reverse=True)
-    return {"total": len(records), "records": records}
+    # 按用户过滤（兼容旧数据：没有 user_id 的数据对所有人可见）
+    user_records = [r for r in records if r.get("user_id", "") == user_id or not r.get("user_id")]
+    user_records.sort(key=lambda x: (x.get('date', ''), x.get('time', '')), reverse=True)
+    return {"total": len(user_records), "records": user_records}
 
 
 @app.get("/api/conversations")
-async def get_conversations():
-    """获取所有会话列表（按更新时间倒序）"""
+async def get_conversations(current_user: dict = Depends(get_current_user)):
+    """获取当前用户的会话列表（按更新时间倒序）"""
+    user_id = current_user.get("uid", "")
+    logger.info(f"🔐 用户 {current_user.get('email', 'unknown')} 请求获取会话列表")
     conversations = load_conversations()
-    conversations.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
-    return {"conversations": conversations}
+    # 按用户过滤（兼容旧数据：没有 user_id 的数据对所有人可见）
+    user_conversations = [c for c in conversations if c.get("user_id", "") == user_id or not c.get("user_id")]
+    user_conversations.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
+    return {"conversations": user_conversations}
 
 
 @app.post("/api/conversations")
-async def create_conversation():
+async def create_conversation(current_user: dict = Depends(get_current_user)):
     """创建新会话"""
+    user_id = current_user.get("uid", "")
+    logger.info(f"🔐 用户 {current_user.get('email', 'unknown')} 创建新会话")
     now = datetime.now()
     conv_id = f"conv_{now.strftime('%Y%m%d_%H%M%S')}"
     iso_now = now.isoformat()
@@ -1016,6 +1437,7 @@ async def create_conversation():
         "created_at": iso_now,
         "updated_at": iso_now,
         "message_count": 0,
+        "user_id": user_id,  # 数据隔离
     }
 
     conversations = load_conversations()
@@ -1026,8 +1448,17 @@ async def create_conversation():
 
 
 @app.get("/api/conversations/{conv_id}/messages")
-async def get_conversation_messages(conv_id: str):
+async def get_conversation_messages(conv_id: str, current_user: dict = Depends(get_current_user)):
     """获取特定会话的所有消息"""
+    user_id = current_user.get("uid", "")
+    logger.info(f"🔐 用户 {current_user.get('email', 'unknown')} 请求获取会话 {conv_id} 的消息")
+    
+    # 验证会话归属
+    conversations = load_conversations()
+    conv = next((c for c in conversations if c.get("id") == conv_id), None)
+    if conv and conv.get("user_id") and conv.get("user_id") != user_id:
+        raise HTTPException(status_code=403, detail="无权访问此会话")
+    
     records = load_records()
     messages = [r for r in records if r.get("conversation_id") == conv_id]
     # 按记录 id 排序（包含时间信息）
@@ -1041,13 +1472,20 @@ class ConversationUpdate(BaseModel):
 
 
 @app.put("/api/conversations/{conv_id}")
-async def update_conversation(conv_id: str, data: ConversationUpdate):
+async def update_conversation(conv_id: str, data: ConversationUpdate, current_user: dict = Depends(get_current_user)):
     """更新会话信息（如标题）"""
+    user_id = current_user.get("uid", "")
+    logger.info(f"🔐 用户 {current_user.get('email', 'unknown')} 更新会话 {conv_id}")
+    
     conversations = load_conversations()
     updated = False
 
     for conv in conversations:
         if conv.get("id") == conv_id:
+            # 验证会话归属
+            if conv.get("user_id") and conv.get("user_id") != user_id:
+                raise HTTPException(status_code=403, detail="无权访问此会话")
+            
             if data.title is not None:
                 conv["title"] = data.title
             conv["updated_at"] = datetime.now().isoformat()
@@ -1062,26 +1500,107 @@ async def update_conversation(conv_id: str, data: ConversationUpdate):
 
 
 @app.delete("/api/conversations/{conv_id}")
-async def delete_conversation(conv_id: str):
+async def delete_conversation(conv_id: str, current_user: dict = Depends(get_current_user)):
     """删除会话及其所有消息"""
-    # 删除会话
+    user_id = current_user.get("uid", "")
+    logger.info(f"🔐 用户 {current_user.get('email', 'unknown')} 删除会话 {conv_id}")
+    
+    # 验证会话归属
     conversations = load_conversations()
+    conv = next((c for c in conversations if c.get("id") == conv_id), None)
+    if not conv:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    if conv.get("user_id") and conv.get("user_id") != user_id:
+        raise HTTPException(status_code=403, detail="无权访问此会话")
+    
+    # 删除会话
     conversations = [c for c in conversations if c.get("id") != conv_id]
     save_conversations(conversations)
 
     # 删除该会话的所有消息
     records = load_records()
+    deleted_record_ids = [r.get("id") for r in records if r.get("conversation_id") == conv_id]
     records = [r for r in records if r.get("conversation_id") != conv_id]
     save_records(records)
+    
+    # ========== 清理 RAG 索引 ==========
+    if deleted_record_ids:
+        try:
+            # 从 chunks_metadata.json 中删除对应记录
+            if METADATA_PATH.exists():
+                with open(METADATA_PATH, 'r', encoding='utf-8') as f:
+                    metadata = json.load(f)
+                
+                original_count = len(metadata)
+                # 过滤掉已删除的记录
+                metadata = [m for m in metadata if m.get("id") not in deleted_record_ids]
+                new_count = len(metadata)
+                
+                if new_count < original_count:
+                    with open(METADATA_PATH, 'w', encoding='utf-8') as f:
+                        json.dump(metadata, f, ensure_ascii=False, indent=2)
+                    logger.info(f"🗑️ 从 RAG 元数据中删除了 {original_count - new_count} 条记录")
+        except Exception as e:
+            logger.warning(f"⚠️ 清理 RAG 索引时出错（不影响删除操作）: {e}", exc_info=True)
+        
+        # ========== 新增：清理 all_chunks.json ==========
+        try:
+            all_chunks_path = VECTOR_INDEXER_DIR / "all_chunks.json"
+            if all_chunks_path.exists():
+                with open(all_chunks_path, 'r', encoding='utf-8') as f:
+                    all_chunks = json.load(f)
+                
+                original_count = len(all_chunks)
+                # 过滤掉已删除的记录
+                all_chunks = [c for c in all_chunks if c.get("id") not in deleted_record_ids]
+                new_count = len(all_chunks)
+                
+                if new_count < original_count:
+                    with open(all_chunks_path, 'w', encoding='utf-8') as f:
+                        json.dump(all_chunks, f, ensure_ascii=False, indent=2)
+                    logger.info(f"🗑️ 从 all_chunks.json 中删除了 {original_count - new_count} 条记录")
+        except Exception as e:
+            logger.warning(f"⚠️ 清理 all_chunks.json 时出错（不影响删除操作）: {e}", exc_info=True)
+        # ========== 新增结束 ==========
+        
+        # ========== 立即触发全量索引重建（不等定时任务）==========
+        if deleted_record_ids:
+            try:
+                # 创建标记文件（check_and_rebuild_index 需要这个标记）
+                FLAG_FILE.touch()
+                # 立即触发全量索引重建
+                scheduler.add_job(
+                    check_and_rebuild_index,
+                    id=f'delete_rebuild_{conv_id}',
+                    name=f'删除后重建索引-{conv_id}',
+                    replace_existing=True
+                )
+                logger.info("📌 已触发删除后全量索引重建")
+            except Exception as e:
+                logger.warning(f"⚠️ 触发重建失败，已设置标记: {e}", exc_info=True)
+        # ========== 重建结束 ==========
+    # ========== 清理结束 ==========
+    
+    # ========== 新增：清理服务端会话历史缓存 ==========
+    # 删除该会话对应的服务端对话历史
+    if conv_id in conversation_histories:
+        del conversation_histories[conv_id]
+        logger.info(f"🗑️ 已清理会话 {conv_id} 的服务端历史缓存")
+    # 兼容旧的 "default" session（如果所有对话都混在 default 里）
+    if "default" in conversation_histories:
+        del conversation_histories["default"]
+        logger.info(f"🗑️ 已清理 default 服务端历史缓存")
+    # ========== 新增结束 ==========
 
     return {"status": "ok"}
 
 @app.post("/api/voice")
-async def add_voice_record(request: VoiceRecordRequest):
+async def add_voice_record(request: VoiceRecordRequest, current_user: dict = Depends(get_current_user)):
     """
     API 端点：添加语音记录（方案 B）
     快捷指令可以通过 POST 请求调用此端点
     """
+    logger.info(f"🔐 用户 {current_user.get('email', 'unknown')} 添加语音记录")
     if not request.content or not request.content.strip():
         raise HTTPException(status_code=400, detail="内容不能为空")
 
@@ -1089,7 +1608,8 @@ async def add_voice_record(request: VoiceRecordRequest):
     conversation_id = request.conversation_id
 
     # 创建新记录（可带会话 ID）
-    record = create_record(content, conversation_id=conversation_id)
+    user_id = current_user.get("uid", "")
+    record = create_record(content, conversation_id=conversation_id, user_id=user_id)
     
     # 加载现有记录并追加
     records = load_records()
@@ -1127,17 +1647,19 @@ async def add_voice_record(request: VoiceRecordRequest):
     }
 
 @app.get("/api/voice/add")
-async def add_voice_record_get(content: str):
+async def add_voice_record_get(content: str, current_user: dict = Depends(get_current_user)):
     """
     GET 方式添加语音记录
     快捷指令可以直接构建 URL: /api/voice/add?content=文本内容
     这样不需要配置 JSON 请求体，大大简化快捷指令的操作
     """
+    logger.info(f"🔐 用户 {current_user.get('email', 'unknown')} 通过 GET 方式添加语音记录")
     if not content or not content.strip():
         raise HTTPException(status_code=400, detail="内容不能为空，请使用 ?content=文本内容")
     
     # 创建新记录
-    record = create_record(content.strip())
+    user_id = current_user.get("uid", "")
+    record = create_record(content.strip(), user_id=user_id)
     
     # 加载现有记录并追加
     records = load_records()
@@ -1157,10 +1679,11 @@ async def add_voice_record_get(content: str):
     }
 
 @app.put("/api/voice/{record_id}")
-async def update_voice_record(record_id: str, request: VoiceRecordRequest):
+async def update_voice_record(record_id: str, request: VoiceRecordRequest, current_user: dict = Depends(get_current_user)):
     """
     API 端点：更新语音记录
     """
+    logger.info(f"🔐 用户 {current_user.get('email', 'unknown')} 更新语音记录 {record_id}")
     if not request.content or not request.content.strip():
         raise HTTPException(status_code=400, detail="内容不能为空")
     
@@ -1565,8 +2088,9 @@ class ChatResponse(BaseModel):
     error: str = None
 
 @app.post("/api/chat", response_model=ChatResponse)
-async def chat_api(request: ChatRequest):
+async def chat_api(request: ChatRequest, current_user: dict = Depends(get_current_user)):
     """RAG 聊天 API 端点"""
+    logger.info(f"📝 用户 {current_user.get('email', 'unknown')} 发起聊天请求")
     if not RAG_AVAILABLE or chat_with_agent is None:
         return ChatResponse(
             response="RAG 功能暂不可用（索引文件未加载）。这是云端演示版，录音功能正常工作。如需完整 RAG 功能，请使用本地版本。",
@@ -1612,9 +2136,357 @@ async def chat_api(request: ChatRequest):
             error=str(e)
         )
 
+def _parse_json_response(ai_response: str, stage_name: str = "扫描"):
+    """
+    解析 AI 返回的 JSON 响应（带容错处理）
+    
+    Args:
+        ai_response: AI 返回的原始文本
+        stage_name: 阶段名称（用于日志）
+        
+    Returns:
+        dict: 解析后的 JSON 对象，如果失败则返回 None
+    """
+    json_error = None
+    
+    # 方法1: 尝试直接解析
+    try:
+        return json.loads(ai_response)
+    except json.JSONDecodeError as e:
+        json_error = e
+        logger.debug(f"⚠️  [{stage_name}] 直接解析失败，尝试提取代码块: {e}")
+        
+        # 方法2: 尝试提取 ```json ... ``` 代码块中的内容
+        json_block_patterns = [
+            r'```json\s*\n(.*?)\n```',  # ```json ... ```
+            r'```\s*\n(.*?)\n```',       # ``` ... ```
+            r'```json\s*(.*?)```',      # ```json ... ``` (单行)
+            r'```\s*(.*?)```'           # ``` ... ``` (单行)
+        ]
+        
+        for pattern in json_block_patterns:
+            match = re.search(pattern, ai_response, re.DOTALL)
+            if match:
+                extracted_json = match.group(1).strip()
+                try:
+                    result = json.loads(extracted_json)
+                    logger.info(f"✅ [{stage_name}] 从代码块中提取 JSON 成功")
+                    return result
+                except json.JSONDecodeError:
+                    continue
+    
+    logger.error(f"❌ [{stage_name}] JSON 解析失败: {json_error}")
+    return None
+
+def _stage2a_screening(records_data: str, background_content: str, client: OpenAI) -> dict:
+    """
+    Stage 2a: 初筛（deepseek）
+    识别哪些记录值得深挖，给出初步观察
+    
+    Args:
+        records_data: 格式化后的记录文本
+        background_content: background.md 的内容
+        client: OpenAI 客户端
+        
+    Returns:
+        dict: 初筛结果，包含 relevant_items, initial_observations, suggested_focus
+        如果失败则返回 {"error": "..."}
+    """
+    import time
+    start_time = time.time()
+    
+    logger.info("🔍 [Stage 2a] 开始初筛（deepseek）...")
+    
+    screening_prompt = f"""分析以下语音记录，识别哪些记录值得深挖，给出初步观察。
+
+分析标准：
+{background_content}
+
+待分析记录：
+{records_data}
+
+任务：
+1. 识别值得关注的记录项（按索引编号）
+2. 总结初步观察到的模式和趋势（2-3段话）
+3. 建议重点关注的方向
+
+要求：返回 JSON 格式：
+{{
+  "relevant_items": [
+    {{"record_index": 1, "summary": "一句话概括", "why_relevant": "为什么值得关注"}}
+  ],
+  "initial_observations": "初步观察到的模式和趋势（2-3段话）",
+  "suggested_focus": ["情绪波动", "工作压力"]
+}}
+
+只返回 JSON，不要其他文字。
+"""
+    
+    try:
+        response = client.chat.completions.create(
+            model="deepseek",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "你是个人状态监控初筛分析师。只返回 JSON，格式：{\"relevant_items\": [...], \"initial_observations\": \"...\", \"suggested_focus\": [...]}。不要其他文字。"
+                },
+                {
+                    "role": "user",
+                    "content": screening_prompt
+                }
+            ],
+            temperature=0.7,
+            max_tokens=2000  # 初筛不需要太长输出
+        )
+        
+        elapsed_time = time.time() - start_time
+        
+        # 检查响应
+        if not response.choices or not response.choices[0].message.content:
+            logger.warning("⚠️  [Stage 2a] deepseek 返回空响应")
+            return {"error": "deepseek 返回空响应"}
+        
+        ai_response = response.choices[0].message.content.strip()
+        logger.info(f"✅ [Stage 2a] deepseek 初筛完成，耗时 {elapsed_time:.2f}秒，响应长度: {len(ai_response)} 字符")
+        
+        # 解析 JSON
+        screening_result = _parse_json_response(ai_response, "Stage 2a")
+        if screening_result is None:
+            return {"error": "Stage 2a JSON 解析失败"}
+        
+        # 验证结构
+        if "relevant_items" not in screening_result:
+            screening_result["relevant_items"] = []
+        if "initial_observations" not in screening_result:
+            screening_result["initial_observations"] = "未生成初步观察"
+        if "suggested_focus" not in screening_result:
+            screening_result["suggested_focus"] = []
+        
+        logger.info(f"📊 [Stage 2a] 识别到 {len(screening_result['relevant_items'])} 条值得关注的记录")
+        return screening_result
+        
+    except Exception as e:
+        elapsed_time = time.time() - start_time
+        logger.exception(f"❌ [Stage 2a] deepseek 调用失败（耗时 {elapsed_time:.2f}秒）: {e}")
+        return {"error": f"Stage 2a 失败: {str(e)}"}
+
+def _stage2b_deep_analysis(screening_result: dict, background_content: str, client: OpenAI) -> dict:
+    """
+    Stage 2b: 深挖（gemini-2.5-pro）
+    基于初筛结果，生成最终的 patterns 和 summary
+    
+    Args:
+        screening_result: Stage 2a 的输出
+        background_content: background.md 的内容
+        client: OpenAI 客户端
+        
+    Returns:
+        dict: 深度分析结果，包含 patterns 和 summary
+        如果失败则返回 {"error": "..."}
+    """
+    import time
+    start_time = time.time()
+    
+    logger.info("🔍 [Stage 2b] 开始深挖（gemini-2.5-pro）...")
+    
+    # 格式化 Stage 2a 的输出
+    relevant_items_text = ""
+    if screening_result.get("relevant_items"):
+        for item in screening_result["relevant_items"]:
+            relevant_items_text += f"- 记录 {item.get('record_index', '?')}: {item.get('summary', '')}（{item.get('why_relevant', '')}）\n"
+    
+    deep_analysis_prompt = f"""基于以下初筛结果，进行深度分析，识别情绪模式、工作压力、项目进展、人际关系问题。
+
+分析标准：
+{background_content}
+
+初筛结果：
+- 值得关注的记录：
+{relevant_items_text if relevant_items_text else "（无）"}
+
+- 初步观察：
+{screening_result.get('initial_observations', '（无）')}
+
+- 建议关注方向：
+{', '.join(screening_result.get('suggested_focus', [])) if screening_result.get('suggested_focus') else '（无）'}
+
+任务：基于以上初筛结果，生成详细的模式识别报告和建议。
+
+要求：返回 JSON 格式，包含 patterns 数组和 summary 字符串。
+patterns 格式：{{"importance": "High|Medium|Low", "pattern": "描述", "evidence": "证据", "suggestion": "建议"}}
+
+只返回 JSON，不要其他文字。
+"""
+    
+    try:
+        response = client.chat.completions.create(
+            model="gemini-2.5-pro",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "你是个人状态监控分析师。只返回 JSON，格式：{\"patterns\": [...], \"summary\": \"...\"}。不要其他文字。"
+                },
+                {
+                    "role": "user",
+                    "content": deep_analysis_prompt
+                }
+            ],
+            temperature=0.7,
+            max_tokens=4000
+        )
+        
+        elapsed_time = time.time() - start_time
+        
+        # 检查响应
+        if not response.choices or not response.choices[0].message.content:
+            logger.warning("⚠️  [Stage 2b] gemini-2.5-pro 返回空响应")
+            return {"error": "gemini-2.5-pro 返回空响应"}
+        
+        # 检查是否因为长度限制被截断
+        choice = response.choices[0]
+        if choice.finish_reason == 'length':
+            logger.warning("⚠️  [Stage 2b] 响应被截断（达到 max_tokens 限制）")
+        
+        ai_response = choice.message.content.strip()
+        logger.info(f"✅ [Stage 2b] gemini-2.5-pro 深挖完成，耗时 {elapsed_time:.2f}秒，响应长度: {len(ai_response)} 字符")
+        
+        # 解析 JSON
+        deep_dive_report = _parse_json_response(ai_response, "Stage 2b")
+        if deep_dive_report is None:
+            return {"error": "Stage 2b JSON 解析失败"}
+        
+        # 验证结构
+        if "patterns" not in deep_dive_report:
+            deep_dive_report["patterns"] = []
+        if "summary" not in deep_dive_report:
+            deep_dive_report["summary"] = "分析完成，但未生成总结。"
+        
+        logger.info(f"📊 [Stage 2b] 识别到 {len(deep_dive_report.get('patterns', []))} 个模式")
+        return deep_dive_report
+        
+    except Exception as e:
+        elapsed_time = time.time() - start_time
+        logger.exception(f"❌ [Stage 2b] gemini-2.5-pro 调用失败（耗时 {elapsed_time:.2f}秒）: {e}")
+        return {"error": f"Stage 2b 失败: {str(e)}"}
+
+def _single_model_analysis(records_data: str, background_content: str, client: OpenAI) -> dict:
+    """
+    单模型分析（Fallback）
+    原来的单模型逻辑，作为双模型失败时的兜底
+    
+    Args:
+        records_data: 格式化后的记录文本
+        background_content: background.md 的内容
+        client: OpenAI 客户端
+        
+    Returns:
+        dict: 分析结果，包含 patterns 和 summary
+        如果失败则返回 {"error": "..."}
+    """
+    import time
+    start_time = time.time()
+    
+    logger.info("🔄 [Fallback] 使用单模型模式...")
+    
+    analysis_prompt = f"""分析以下语音记录，识别情绪模式、工作压力、项目进展、人际关系问题。
+
+分析标准：
+{background_content}
+
+待分析记录：
+{records_data}
+
+要求：返回 JSON 格式，包含 patterns 数组和 summary 字符串。
+patterns 格式：{{"importance": "High|Medium|Low", "pattern": "描述", "evidence": "证据", "suggestion": "建议"}}
+
+只返回 JSON，不要其他文字。
+"""
+    
+    # 尝试使用不同的模型
+    models_to_try = ["deepseek", "gemini-2.5-pro", "gpt-5"]
+    
+    last_error = None
+    response = None
+    
+    for model_name in models_to_try:
+        try:
+            logger.info(f"   尝试使用模型: {model_name}")
+            
+            temperature = 1.0 if model_name == "gpt-5" else 0.7
+            
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "你是个人状态监控分析师。只返回 JSON，格式：{{\"patterns\": [...], \"summary\": \"...\"}}。不要其他文字。"
+                    },
+                    {
+                        "role": "user",
+                        "content": analysis_prompt
+                    }
+                ],
+                temperature=temperature,
+                max_tokens=4000
+            )
+            
+            logger.info(f"   ✅ 模型 {model_name} 调用成功")
+            
+            # 检查是否因为长度限制被截断
+            if response.choices and len(response.choices) > 0:
+                choice = response.choices[0]
+                if choice.finish_reason == 'length':
+                    logger.warning("⚠️  [Fallback] 响应被截断（达到 max_tokens 限制）")
+                    if not choice.message.content:
+                        if model_name != models_to_try[-1]:
+                            continue
+                        else:
+                            return {
+                                "error": "AI 响应被截断且内容为空。"
+                            }
+            
+            break  # 成功则跳出循环
+            
+        except Exception as model_error:
+            last_error = model_error
+            logger.warning(f"   ⚠️  模型 {model_name} 调用失败: {str(model_error)[:200]}")
+            if model_name != models_to_try[-1]:
+                logger.info(f"   尝试下一个模型...")
+                continue
+            else:
+                # 所有模型都失败
+                elapsed_time = time.time() - start_time
+                logger.error(f"❌ [Fallback] 所有模型都失败（耗时 {elapsed_time:.2f}秒）")
+                return {"error": f"所有模型调用都失败: {str(last_error)[:200]}"}
+    
+    if response is None:
+        elapsed_time = time.time() - start_time
+        logger.error(f"❌ [Fallback] 未获得有效响应（耗时 {elapsed_time:.2f}秒）")
+        return {"error": "未获得有效响应"}
+    
+    elapsed_time = time.time() - start_time
+    ai_response = response.choices[0].message.content.strip()
+    logger.info(f"✅ [Fallback] 单模型分析完成，耗时 {elapsed_time:.2f}秒，响应长度: {len(ai_response)} 字符")
+    
+    # 解析 JSON
+    deep_dive_report = _parse_json_response(ai_response, "Fallback")
+    if deep_dive_report is None:
+        return {"error": "Fallback JSON 解析失败"}
+    
+    # 验证结构
+    if "patterns" not in deep_dive_report:
+        deep_dive_report["patterns"] = []
+    if "summary" not in deep_dive_report:
+        deep_dive_report["summary"] = "分析完成，但未生成总结。"
+    
+    logger.info(f"📊 [Fallback] 识别到 {len(deep_dive_report.get('patterns', []))} 个模式")
+    return deep_dive_report
+
 def _perform_scan():
     """
     执行扫描的核心逻辑（可复用）
+    使用双模型协作架构：Stage 2a (deepseek 初筛) -> Stage 2b (gpt-5 深挖)
+    如果失败，降级到单模型模式
     
     Returns:
         dict: 扫描结果，格式为 {
@@ -1668,7 +2540,7 @@ def _perform_scan():
         
         logger.info(f"📊 [扫描] 找到 {len(recent_records)} 条最近 7 天的记录")
         
-        # ========== Stage 2: 深度分析 ==========
+        # ========== Stage 2: 深度分析（双模型协作架构）==========
         # 读取 background.md
         background_file = VECTOR_INDEXER_DIR / "background.md"
         if not background_file.exists():
@@ -1705,22 +2577,7 @@ def _perform_scan():
                 records_data = records_data[first_newline+1:]
             records_data = f"[注意：由于内容过长，仅显示部分记录]\n{records_data}"
         
-        # 构造 prompt（简化版本，减少 token 消耗）
-        analysis_prompt = f"""分析以下语音记录，识别情绪模式、工作压力、项目进展、人际关系问题。
-
-分析标准：
-{background_content}
-
-待分析记录：
-{records_data}
-
-要求：返回 JSON 格式，包含 patterns 数组和 summary 字符串。
-patterns 格式：{{"importance": "High|Medium|Low", "pattern": "描述", "evidence": "证据", "suggestion": "建议"}}
-
-只返回 JSON，不要其他文字。
-"""
-
-        # 调用 AI API
+        # 初始化 OpenAI 客户端
         api_key = os.getenv("AI_BUILDER_TOKEN")
         if not api_key:
             return {
@@ -1734,129 +2591,53 @@ patterns 格式：{{"importance": "High|Medium|Low", "pattern": "描述", "evide
             max_retries=3  # 最大重试 3 次
         )
         
-        logger.info(f"🤖 [扫描] 正在调用 AI API 进行深度分析...")
-        logger.info(f"   - Prompt 长度: {len(analysis_prompt)} 字符")
+        logger.info(f"🤖 [扫描] 开始双模型协作分析...")
         logger.info(f"   - 记录数量: {len(recent_records)} 条")
+        logger.info(f"   - 数据长度: {len(records_data)} 字符")
+        
+        # ========== 尝试双模型协作架构 ==========
+        deep_dive_report = None
         
         try:
-            # 尝试使用不同的模型，优先使用 deepseek（更稳定，能处理超长 prompt）
-            models_to_try = ["deepseek", "gemini-2.5-pro", "gpt-5"]
+            # Stage 2a: 初筛（deepseek）
+            screening_result = _stage2a_screening(records_data, background_content, client)
             
-            last_error = None
-            response = None
-            
-            for model_name in models_to_try:
-                try:
-                    logger.info(f"   尝试使用模型: {model_name}")
-                    response = client.chat.completions.create(
-                        model=model_name,
-                        messages=[
-                            {
-                                "role": "system",
-                                "content": "你是个人状态监控分析师。只返回 JSON，格式：{{\"patterns\": [...], \"summary\": \"...\"}}。不要其他文字。"
-                            },
-                            {
-                                "role": "user",
-                                "content": analysis_prompt
-                            }
-                        ],
-                        temperature=0.7,
-                        max_tokens=4000  # 增加输出限制，确保有足够空间生成完整响应
-                    )
-                    logger.info(f"   ✅ 模型 {model_name} 调用成功")
-                    
-                    # 检查是否因为长度限制被截断
-                    if response.choices and len(response.choices) > 0:
-                        choice = response.choices[0]
-                        if choice.finish_reason == 'length':
-                            logger.warning("⚠️  [扫描] 响应被截断（达到 max_tokens 限制）")
-                            # 如果 content 为空，返回错误
-                            if not choice.message.content:
-                                return {
-                                    "error": "AI 响应被截断且内容为空。请减少分析的记录数量，或稍后重试。",
-                                    "details": f"prompt_tokens: {response.usage.prompt_tokens if hasattr(response, 'usage') else 'N/A'}, max_tokens: 4000, finish_reason: {choice.finish_reason}",
-                                    "suggestion": "尝试减少扫描天数或记录数量"
-                                }
-                    
-                    break  # 成功则跳出循环
-                except Exception as model_error:
-                    last_error = model_error
-                    logger.warning(f"   ⚠️  模型 {model_name} 调用失败: {str(model_error)[:200]}")
-                    if model_name != models_to_try[-1]:
-                        logger.info(f"   尝试下一个模型...")
-                        continue
-                    else:
-                        # 所有模型都失败，抛出最后一个错误
-                        raise
-            
-            if response is None:
-                raise last_error if last_error else Exception("所有模型调用都失败")
+            if "error" in screening_result:
+                logger.warning(f"⚠️  [扫描] Stage 2a 失败，降级到单模型模式: {screening_result['error']}")
+                # 降级到单模型模式
+                deep_dive_report = _single_model_analysis(records_data, background_content, client)
+            else:
+                # Stage 2b: 深挖（gpt-5）
+                deep_dive_report = _stage2b_deep_analysis(screening_result, background_content, client)
                 
-        except Exception as api_error:
-            logger.exception(f"❌ [扫描] AI API 调用失败: {api_error}")
-            error_msg = str(api_error)
-            if "Connection" in error_msg or "timeout" in error_msg.lower():
+                if "error" in deep_dive_report:
+                    logger.warning(f"⚠️  [扫描] Stage 2b 失败，降级到单模型模式: {deep_dive_report['error']}")
+                    # 降级到单模型模式
+                    deep_dive_report = _single_model_analysis(records_data, background_content, client)
+                
+        except Exception as e:
+            logger.exception(f"❌ [扫描] 双模型协作过程中出现异常，降级到单模型模式: {e}")
+            # 降级到单模型模式
+            deep_dive_report = _single_model_analysis(records_data, background_content, client)
+        
+        # 检查最终结果
+        if deep_dive_report is None or "error" in deep_dive_report:
+            error_msg = deep_dive_report.get("error", "未知错误") if deep_dive_report else "未获得分析结果"
+            logger.error(f"❌ [扫描] 分析失败: {error_msg}")
+            
+            # 检查是否是连接问题
+            error_str = str(error_msg).lower()
+            if "connection" in error_str or "timeout" in error_str:
                 return {
                     "error": "AI API 连接超时或失败。可能原因：1) 网络连接问题 2) 请求内容过长 3) API 服务暂时不可用。请稍后重试，或减少分析的数据量。",
                     "details": error_msg[:200],
                     "records_count": len(recent_records),
-                    "content_length": len(analysis_prompt)
+                    "content_length": len(records_data)
                 }
             else:
                 return {
-                    "error": f"AI API 调用失败: {error_msg[:200]}"
+                    "error": f"分析失败: {error_msg[:200]}"
                 }
-        
-        ai_response = response.choices[0].message.content.strip()
-        logger.info(f"✅ [扫描] AI 分析完成，响应长度: {len(ai_response)} 字符")
-        
-        # 解析 JSON 响应（带容错处理）
-        deep_dive_report = None
-        json_error = None
-        
-        # 方法1: 尝试直接解析
-        try:
-            deep_dive_report = json.loads(ai_response)
-            logger.debug("✅ [扫描] JSON 直接解析成功")
-        except json.JSONDecodeError as e:
-            json_error = e
-            logger.debug(f"⚠️  [扫描] 直接解析失败，尝试提取代码块: {e}")
-            
-            # 方法2: 尝试提取 ```json ... ``` 代码块中的内容
-            json_block_patterns = [
-                r'```json\s*\n(.*?)\n```',  # ```json ... ```
-                r'```\s*\n(.*?)\n```',       # ``` ... ```
-                r'```json\s*(.*?)```',      # ```json ... ``` (单行)
-                r'```\s*(.*?)```'           # ``` ... ``` (单行)
-            ]
-            
-            for pattern in json_block_patterns:
-                match = re.search(pattern, ai_response, re.DOTALL)
-                if match:
-                    extracted_json = match.group(1).strip()
-                    try:
-                        deep_dive_report = json.loads(extracted_json)
-                        logger.info(f"✅ [扫描] 从代码块中提取 JSON 成功")
-                        break
-                    except json.JSONDecodeError:
-                        continue
-        
-        # 如果仍然失败，返回错误信息
-        if deep_dive_report is None:
-            logger.error(f"❌ [扫描] JSON 解析失败: {json_error}")
-            return {
-                "error": "AI 返回的内容无法解析为有效的 JSON 格式",
-                "details": str(json_error) if json_error else "未知错误",
-                "raw_response_preview": ai_response[:500]
-            }
-        
-        # 验证返回结构
-        if "patterns" not in deep_dive_report or "summary" not in deep_dive_report:
-            logger.warning("⚠️  [扫描] AI 返回的结构不完整，尝试修复...")
-            if "patterns" not in deep_dive_report:
-                deep_dive_report["patterns"] = []
-            if "summary" not in deep_dive_report:
-                deep_dive_report["summary"] = "分析完成，但未生成总结。"
         
         # ========== 返回结果 ==========
         result = {
@@ -1876,10 +2657,11 @@ patterns 格式：{{"importance": "High|Medium|Low", "pattern": "描述", "evide
         }
 
 @app.get("/api/last-scan")
-async def get_last_scan():
+async def get_last_scan(current_user: dict = Depends(get_current_user)):
     """
     获取最近一次自动扫描的结果
     """
+    logger.info(f"🔐 用户 {current_user.get('email', 'unknown')} 请求获取扫描结果")
     if not SCAN_RESULTS_FILE.exists():
         return JSONResponse(
             status_code=200,
@@ -1902,12 +2684,12 @@ async def get_last_scan():
         )
 
 @app.post("/api/trigger-auto-scan")
-async def trigger_auto_scan():
+async def trigger_auto_scan(current_user: dict = Depends(get_current_user)):
     """
     手动触发自动扫描（立即执行一次并保存结果）
     """
+    logger.info(f"🔐 用户 {current_user.get('email', 'unknown')} 手动触发自动扫描...")
     try:
-        logger.info("🔄 [手动触发] 用户手动触发自动扫描...")
         auto_scan()  # 直接调用自动扫描函数
         
         # 读取刚保存的结果
@@ -1941,7 +2723,7 @@ async def trigger_auto_scan():
         )
 
 @app.post("/run-scan")
-async def run_scan():
+async def run_scan(current_user: dict = Depends(get_current_user)):
     """
     个人状态监控扫描端点
     
@@ -1950,6 +2732,7 @@ async def run_scan():
     
     注意：手动扫描的结果也会保存到 scan_results.json（与自动扫描一致）
     """
+    logger.info(f"🔐 用户 {current_user.get('email', 'unknown')} 请求执行扫描")
     result = _perform_scan()
     
     # 保存结果到文件（与自动扫描保持一致）
@@ -1973,14 +2756,16 @@ async def run_scan():
     return JSONResponse(status_code=200, content=result)
 
 @app.get("/api/index-status")
-async def get_index_status_api():
+async def get_index_status_api(current_user: dict = Depends(get_current_user)):
     """获取索引重建状态"""
+    logger.info(f"🔐 用户 {current_user.get('email', 'unknown')} 请求获取索引状态")
     status = get_index_status()
     return status
 
 @app.post("/api/rebuild-index")
-async def rebuild_index_api(background_tasks: BackgroundTasks):
+async def rebuild_index_api(background_tasks: BackgroundTasks, current_user: dict = Depends(get_current_user)):
     """手动触发索引重建"""
+    logger.info(f"🔐 用户 {current_user.get('email', 'unknown')} 请求重建索引")
     if not RAG_AVAILABLE:
         return {
             "success": False,
@@ -2326,8 +3111,54 @@ async def admin_page():
                 line-height: 1.6;
             }}
         </style>
+        <script type="module">
+            import {{ initializeApp }} from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
+            import {{ getAuth, onAuthStateChanged }} from "https://www.gstatic.com/firebasejs/10.7.1/firebase-auth.js";
+            
+            const firebaseConfig = {{
+                apiKey: "AIzaSyDuWwWz2vWm6FV50w5ozL0DFoxfJfcEy0g",
+                authDomain: "voice-journal-auth-ba3b0.firebaseapp.com",
+                projectId: "voice-journal-auth-ba3b0"
+            }};
+            
+            const app = initializeApp(firebaseConfig);
+            const auth = getAuth(app);
+            
+            // 全局 token 存储
+            window.authToken = null;
+            
+            // 检查登录状态
+            onAuthStateChanged(auth, (user) => {{
+                if (user) {{
+                    user.getIdToken().then(token => {{
+                        window.authToken = token;
+                        document.getElementById('adminContent').style.display = 'block';
+                        document.getElementById('loadingOverlay').style.display = 'none';
+                    }});
+                }} else {{
+                    // 未登录，跳转到主页
+                    window.location.href = '/';
+                }}
+            }});
+            
+            // Token 刷新（每 55 分钟）
+            setInterval(() => {{
+                const user = auth.currentUser;
+                if (user) {{
+                    user.getIdToken(true).then(token => {{
+                        window.authToken = token;
+                    }});
+                }}
+            }}, 55 * 60 * 1000);
+        </script>
     </head>
     <body>
+        <!-- 加载遮罩（等待认证检查） -->
+        <div id="loadingOverlay" style="position:fixed;top:0;left:0;right:0;bottom:0;background:#343541;display:flex;align-items:center;justify-content:center;z-index:9999;">
+            <div style="color:#ececf1;font-size:16px;">验证登录状态...</div>
+        </div>
+        
+        <div id="adminContent" style="display:none;">
         <div class="header">
             <h1>⚙️ 管理设置</h1>
             <a href="/" class="back-btn">
@@ -2423,7 +3254,9 @@ async def admin_page():
             // ========== 扫描功能 ==========
             async function loadLastScan() {{
                 try {{
-                    const response = await fetch('/api/last-scan');
+                    const response = await fetch('/api/last-scan', {{
+                        headers: {{ 'Authorization': 'Bearer ' + window.authToken }}
+                    }});
                     if (response.ok) {{
                         const data = await response.json();
                         if (data.scan_time) {{
@@ -2462,7 +3295,10 @@ async def admin_page():
                 results.innerHTML = '<div class="empty-state">正在分析记录，请稍候...</div>';
                 
                 try {{
-                    const response = await fetch('/run-scan', {{ method: 'POST' }});
+                    const response = await fetch('/run-scan', {{
+                        method: 'POST',
+                        headers: {{ 'Authorization': 'Bearer ' + window.authToken }}
+                    }});
                     const data = await response.json();
                     
                     if (data.error) {{
@@ -2485,7 +3321,10 @@ async def admin_page():
                 btn.textContent = '触发中...';
                 
                 try {{
-                    const response = await fetch('/api/trigger-auto-scan', {{ method: 'POST' }});
+                    const response = await fetch('/api/trigger-auto-scan', {{
+                        method: 'POST',
+                        headers: {{ 'Authorization': 'Bearer ' + window.authToken }}
+                    }});
                     const data = await response.json();
                     
                     if (data.success && data.scan_result) {{
@@ -2538,7 +3377,9 @@ async def admin_page():
             
             async function checkIndexStatus() {{
                 try {{
-                    const response = await fetch('/api/index-status');
+                    const response = await fetch('/api/index-status', {{
+                        headers: {{ 'Authorization': 'Bearer ' + window.authToken }}
+                    }});
                     const data = await response.json();
                     updateIndexStatusDisplay(data);
                     
@@ -2596,7 +3437,10 @@ async def admin_page():
                 status.className = 'status-text running';
                 
                 try {{
-                    const response = await fetch('/api/rebuild-index', {{ method: 'POST' }});
+                    const response = await fetch('/api/rebuild-index', {{
+                        method: 'POST',
+                        headers: {{ 'Authorization': 'Bearer ' + window.authToken }}
+                    }});
                     const data = await response.json();
                     
                     if (data.success) {{
@@ -2622,6 +3466,7 @@ async def admin_page():
                 return div.innerHTML;
             }}
         </script>
+        </div>
     </body>
     </html>
     """
