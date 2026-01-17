@@ -29,3 +29,6 @@ logs/
 venv/
 *.swp
 *.swo
+
+# 测试文件（包含敏感信息）
+test_auth.py
